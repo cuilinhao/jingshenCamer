@@ -1,0 +1,61 @@
+== Swift version ==
+Swift version 6.2.1 (swift-6.2.1-RELEASE)
+Target: x86_64-unknown-linux-gnu
+== Swift syntax only (NOT iOS typechecking) ==
+== Compile and run pure Swift policy checks ==
+PASS: 最小虚拟光圈
+PASS: 默认虚拟光圈
+PASS: slider 下界
+PASS: slider 上界
+PASS: slider NaN
+PASS: slider infinity
+PASS: f 值夹取下界
+PASS: f 值夹取上界
+PASS: f 值 NaN
+PASS: 用户可关闭景深
+PASS: 深度模式不能写低于硬件下限的变焦
+PASS: 硬件变焦上限
+PASS: 用户缩放上限不能低于硬件最小值
+PASS: 变焦 NaN
+PASS: 合法变焦不变
+PASS: 有效分层深度
+PASS: 空深度不能假成功
+PASS: 过多无效深度
+PASS: 无分层深度
+PASS: NaN 深度
+PASS: 无效负视差
+PASS: 景深成功状态
+PASS: 缺深度不能显示为景深成功
+PASS: 旧机型保留普通拍照
+PASS: 渲染失败不伪装成功
+
+25 policy checks passed.
+== Source contracts ==
+test_depth_renderer_and_explicit_fallback (__main__.SourceContracts.test_depth_renderer_and_explicit_fallback) ... ok
+test_ios17_and_no_implicit_main_actor_for_worker (__main__.SourceContracts.test_ios17_and_no_implicit_main_actor_for_worker) ... ok
+test_jpeg_saved_from_encoded_result_not_ui_preview (__main__.SourceContracts.test_jpeg_saved_from_encoded_result_not_ui_preview) ... ok
+test_no_focus_persistence_or_third_party_sources (__main__.SourceContracts.test_no_focus_persistence_or_third_party_sources) ... ok
+test_ordinary_preview_remains_without_stream_processors (__main__.SourceContracts.test_ordinary_preview_remains_without_stream_processors) ... ok
+test_photo_output_prepares_native_depth (__main__.SourceContracts.test_photo_output_prepares_native_depth) ... ok
+test_preview_does_not_require_ios26_scene_geometry (__main__.SourceContracts.test_preview_does_not_require_ios26_scene_geometry) ... ok
+test_terminal_capture_callback_and_identity_guard (__main__.SourceContracts.test_terminal_capture_callback_and_identity_guard) ... ok
+test_virtual_camera_candidates_and_zoom_limits (__main__.SourceContracts.test_virtual_camera_candidates_and_zoom_limits) ... ok
+
+----------------------------------------------------------------------
+Ran 9 tests in 0.002s
+
+OK
+== XML / assets ==
+XML OK: TestCamer/Base.lproj/LaunchScreen.storyboard
+XML OK: TestCamer/Base.lproj/Main.storyboard
+XML OK: TestCamer.xcodeproj/xcshareddata/xcschemes/TestCamer.xcscheme
+XML OK: TestCamer.xcodeproj/project.xcworkspace/contents.xcworkspacedata
+JSON OK: TestCamer/Assets.xcassets/Contents.json
+JSON OK: TestCamer/Assets.xcassets/AccentColor.colorset/Contents.json
+JSON OK: TestCamer/Assets.xcassets/AppIcon.appiconset/Contents.json
+TestCamer/Info.plist: OK
+TestCamer.xcodeproj/project.pbxproj: OK
+Local checks complete. iOS SDK build / signing / device effects are NOT covered.
+
+== Environment limitations ==
+xcodebuild unavailable in current Linux environment. No iOS SDK build, signing, device or visual test was performed.
