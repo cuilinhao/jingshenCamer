@@ -59,7 +59,11 @@ final class DepthPhotoProcessor: @unchecked Sendable {
         var uprightProperties = rawImage.properties
         uprightProperties[kCGImagePropertyOrientation as String] = 1
         let original = normalizedOrigin(rawImage.oriented(orientation)).settingProperties(uprightProperties)
-        guard !original.extent.isEmpty, !original.extent.isInfinite else { throw CameraError.captureFailed }
+        guard !original.extent.isEmpty, !original.extent.isInfinite,
+              let originalCGImage = context.createCGImage(original, from: original.extent,
+                                                          format: .RGBA8, colorSpace: colorSpace) else {
+            throw CameraError.captureFailed
+        }
 
         var outcome: DepthRenderOutcome
         var renderedCGImage: CGImage?
@@ -81,18 +85,43 @@ final class DepthPhotoProcessor: @unchecked Sendable {
                         portraitEffectsMatte: portraitMatte(from: source, orientation: orientation),
                         orientation: .up,
                         options: nil),
-                      filter.inputKeys.contains("inputAperture") {
+                      filter.inputKeys.contains("inputAperture"), filter.inputKeys.contains("inputFocusRect") {
                 // 工厂会准备原生景深需要的辅助信息；不要再 setDefaults() 把这些信息清空。
-                // 本版不覆盖焦点矩形：使用系统自动景深选择。保留原 Demo 的硬件点按对焦，
-                // 但不承诺“点击位置 = 自定义算法焦平面”，也不实现拍后重新对焦。
                 filter.setValue(NSNumber(value: photo.options.aperture), forKey: "inputAperture")
-                print("[Depth] using native depth blur, virtual f/\(photo.options.aperture)")
-                if let rendered = filter.outputImage {
-                    renderedCGImage = context.createCGImage(rendered.cropped(to: original.extent),
-                                                            from: original.extent,
-                                                            format: .RGBA8, colorSpace: colorSpace)
+                var focusSource = "system"
+                if let point = photo.options.focusPoint {
+                    // AVCapture 的对焦坐标以传感器左上为原点；Core Image 是左下。
+                    // 先转换到原始照片，再与 RGB/深度应用同一 EXIF 旋转/镜像。
+                    let sensorPoint = CGPoint(x: rawImage.extent.minX + point.x * rawImage.extent.width,
+                                              y: rawImage.extent.minY + (1 - point.y) * rawImage.extent.height)
+                    let uprightPoint = sensorPoint.applying(rawImage.orientationTransform(for: orientation))
+                    let orientedExtent = rawImage.oriented(orientation).extent
+                    let normalizedPoint = CGPoint(x: (uprightPoint.x - orientedExtent.minX) / orientedExtent.width,
+                                                  y: (uprightPoint.y - orientedExtent.minY) / orientedExtent.height)
+                    filter.setValue(CIVector(cgRect: focusRectangle(at: normalizedPoint)), forKey: "inputFocusRect")
+                    focusSource = "tap"
                 }
-                outcome = renderedCGImage == nil ? .renderFailed : .applied
+                renderedCGImage = renderDepthFilter(filter, extent: original.extent)
+                var change = renderedCGImage.map { pixelDifference($0, originalCGImage) } ?? 0
+                // 非人脸、偏中心主体时，系统可能把背景选为清晰面，返回完全未变的图像。
+                // 只有自动选择无效才用本张真实视差寻找近景；不覆盖用户主动点选的背景。
+                if renderedCGImage != nil, change < 0.5, photo.options.focusPoint == nil,
+                   let rectangle = foregroundFocusRectangle(in: disparity) {
+                    filter.setValue(CIVector(cgRect: rectangle), forKey: "inputFocusRect")
+                    focusSource = "depth-foreground"
+                    renderedCGImage = renderDepthFilter(filter, extent: original.extent)
+                    change = renderedCGImage.map { pixelDifference($0, originalCGImage) } ?? 0
+                }
+                if renderedCGImage == nil {
+                    outcome = .renderFailed
+                } else if change < 0.5 {
+                    outcome = .noVisibleEffect
+                    renderedCGImage = nil
+                } else {
+                    outcome = .applied
+                }
+                print(String(format: "[Depth] native focus=%@, virtual f/%.1f, pixelChange=%.3f/255 (linear RGB)",
+                             focusSource, photo.options.aperture, change))
             } else {
                 outcome = .renderFailed
             }
@@ -104,8 +133,7 @@ final class DepthPhotoProcessor: @unchecked Sendable {
         // 不悄悄改成全图模糊，也不伪造一次“景深成功”。
         if renderedCGImage == nil {
             print("[Depth] fallback: \(outcome.rawValue)")
-            renderedCGImage = context.createCGImage(original, from: original.extent,
-                                                    format: .RGBA8, colorSpace: colorSpace)
+            renderedCGImage = originalCGImage
         }
         guard let cgImage = renderedCGImage else { throw CameraError.captureFailed }
         let jpeg = try encodeJPEG(cgImage, quality: 0.95)
@@ -117,6 +145,68 @@ final class DepthPhotoProcessor: @unchecked Sendable {
         return ProcessedPhoto(jpegData: jpeg, previewData: preview, originalPreviewData: before,
                               outcome: outcome, aperture: photo.options.aperture,
                               pixelWidth: cgImage.width, pixelHeight: cgImage.height)
+    }
+
+    private func renderDepthFilter(_ filter: CIFilter, extent: CGRect) -> CGImage? {
+        guard let image = filter.outputImage else { return nil }
+        return context.createCGImage(image.cropped(to: extent), from: extent, format: .RGBA8, colorSpace: colorSpace)
+    }
+
+    private func focusRectangle(at point: CGPoint) -> CGRect {
+        let side: CGFloat = 0.06
+        return CGRect(x: min(max(point.x - side / 2, 0), 1 - side),
+                      y: min(max(point.y - side / 2, 0), 1 - side), width: side, height: side)
+    }
+
+    /// 在真实视差上寻找连续的近景小区域。3×3 的最小值可排除孤立的异常高值，
+    /// 相同深度优先靠近画面中心；采样只用于选焦点，不改滤镜收到的原始视差。
+    private func foregroundFocusRectangle(in disparity: CIImage) -> CGRect? {
+        let size = 48
+        let small = normalizedOrigin(disparity).transformed(by: CGAffineTransform(
+            scaleX: CGFloat(size) / disparity.extent.width, y: CGFloat(size) / disparity.extent.height))
+        var samples = [Float](repeating: 0, count: size * size)
+        context.render(small, toBitmap: &samples, rowBytes: size * MemoryLayout<Float>.stride,
+                       bounds: CGRect(x: 0, y: 0, width: size, height: size), format: .Rf, colorSpace: nil)
+        var bestDepth: Float = 0
+        var bestDistance = CGFloat.infinity
+        var bestPoint: CGPoint?
+        for y in 2..<(size - 2) {
+            for x in 2..<(size - 2) {
+                var nearestPlane = Float.infinity
+                for dy in -1...1 {
+                    for dx in -1...1 {
+                        let value = samples[(y + dy) * size + x + dx]
+                        nearestPlane = value.isFinite && value > 0 ? min(nearestPlane, value) : 0
+                    }
+                }
+                let point = CGPoint(x: (CGFloat(x) + 0.5) / CGFloat(size),
+                                    y: 1 - (CGFloat(y) + 0.5) / CGFloat(size))
+                let distance = pow(point.x - 0.5, 2) + pow(point.y - 0.5, 2)
+                if nearestPlane > bestDepth || (nearestPlane == bestDepth && distance < bestDistance) {
+                    bestDepth = nearestPlane
+                    bestDistance = distance
+                    bestPoint = point
+                }
+            }
+        }
+        guard bestDepth > 0, let point = bestPoint else { return nil }
+        return focusRectangle(at: point)
+    }
+
+    /// 在原分辨率先求差再规约。先缩图会把细纹理的虚化差异抹掉，误丢弃有效成片。
+    private func pixelDifference(_ result: CGImage, _ original: CGImage) -> Double {
+        let before = CIImage(cgImage: original)
+        let difference = CIImage(cgImage: result).applyingFilter("CIDifferenceBlendMode", parameters: [
+            kCIInputBackgroundImageKey: before
+        ])
+        let average = difference.applyingFilter("CIAreaAverage", parameters: [
+            kCIInputExtentKey: CIVector(cgRect: before.extent)
+        ])
+        var pixel = [Float](repeating: 0, count: 4)
+        // 不对差值做 sRGB 编码；读取同一工作空间下的线性 RGB 平均差。
+        context.render(average, toBitmap: &pixel, rowBytes: 4 * MemoryLayout<Float>.stride,
+                       bounds: CGRect(x: 0, y: 0, width: 1, height: 1), format: .RGBAf, colorSpace: nil)
+        return Double(pixel[0] + pixel[1] + pixel[2]) / 3 * 255
     }
 
     private func depthData(from source: CGImageSource) -> AVDepthData? {

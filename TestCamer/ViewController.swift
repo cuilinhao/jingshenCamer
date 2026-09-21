@@ -715,7 +715,7 @@ private extension ViewController {
         } else if !supported {
             depthHintLabel.text = "当前相机不支持原生深度，仍可普通拍照。"
         } else {
-            depthHintLabel.text = active ? "预览不虚化 · 仅成片生效 · 不保存聚焦位置" : "景深已关闭 · 成片不添加算法虚化"
+            depthHintLabel.text = active ? "仅成片虚化 · 可点按主体选择清晰区域" : "景深已关闭 · 成片不添加算法虚化"
         }
         let aperture = DepthCapturePolicy.aperture(sliderValue: apertureSlider.value)
         apertureLabel.text = String(format: "f/%.1f", aperture)

@@ -9,6 +9,7 @@ fi
 command -v xcodebuild >/dev/null || { echo "未找到 xcodebuild" >&2; exit 2; }
 xcodebuild -version
 bash "$ROOT/Scripts/verify_local.sh"
+bash "$ROOT/Scripts/verify_depth_rendering.sh"
 BUILD_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/testcamer-xcodebuild.XXXXXX")"
 echo "构建产物与日志目录：$BUILD_ROOT"
 # 不签名的通用真机 SDK 构建，用来检查 iOS API、Swift 类型和资源编译。

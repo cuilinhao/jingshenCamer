@@ -10,24 +10,6 @@ import Foundation
 @preconcurrency import AVFoundation
 
 // 工程不再默认把所有类型隔离到 MainActor；相机可变状态只在 sessionQueue 访问。
-enum CameraError: LocalizedError, Equatable, Sendable {
-    case notAuthorized, unavailable, configurationFailed, captureFailed
-    case photoLibraryDenied, busy, interrupted, captureTimedOut
-
-    var errorDescription: String? {
-        switch self {
-        case .notAuthorized: return "未获得相机权限，请在设置中开启。"
-        case .unavailable: return "当前没有可用相机画面，请使用真机并检查相机是否被占用。"
-        case .configurationFailed: return "相机初始化失败，请退出拍照页后重试。"
-        case .captureFailed: return "拍照失败，请重试。"
-        case .photoLibraryDenied: return "未获得相册写入权限，照片无法保存。"
-        case .busy: return "照片正在处理中，请稍候。"
-        case .interrupted: return "相机被中断，请回到 App 后重试。"
-        case .captureTimedOut: return "本次拍摄等待超时，相机正在恢复，请重新拍摄。"
-        }
-    }
-}
-
 /// 传给 UI 的不可变快照。UI 不再直接跨线程读取 deviceInput / zoomFactor。
 struct CameraState: Sendable {
     let isFront: Bool
@@ -44,14 +26,6 @@ enum CameraEvent: Sendable {
     case issue(String)
 }
 
-/// 原始文件（可能临时嵌有深度）仅在内存中用于这一次处理，不写磁盘、不直接保存到相册。
-struct CapturedPhoto: Sendable {
-    let data: Data
-    let depthRequested: Bool
-    let hasDepthData: Bool
-    let options: DepthOptions
-}
-
 /// @unchecked Sendable 的依据：除只用于连接预览的 session 引用外，所有可变状态
 /// 都封闭在 sessionQueue；delegate 也先回到同一队列，外部只得到不可变值。
 final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked Sendable {
@@ -63,6 +37,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
     private var position: AVCaptureDevice.Position = .back
     private var isConfigured = false
     private var wantsToRun = false
+    private var depthFocusPoint: CGPoint?
     private var eventHandler: (@Sendable (CameraEvent) -> Void)?
     private var observers: [NSObjectProtocol] = []
 
@@ -130,6 +105,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
     func stop() {
         sessionQueue.async { [self] in
             wantsToRun = false
+            depthFocusPoint = nil
             if let pending = pendingCapture {
                 finishCapture(id: pending.id, result: .failure(CameraError.interrupted))
             }
@@ -179,7 +155,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
         }
     }
 
-    /// 保留原 Demo 的硬件点按对焦；不保留坐标副本、不写照片参数、不输出坐标日志。
+    /// 点按同时指定下一张照片的景深清晰区域；只在内存中传递，不写入照片或日志。
     func focus(at point: CGPoint) {
         sessionQueue.async { [self] in
             guard pendingCapture == nil, let device = deviceInput?.device else { return }
@@ -195,7 +171,8 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
                     device.exposureMode = .autoExpose
                 }
                 device.isSubjectAreaChangeMonitoringEnabled = true
-                print("[Camera] hardware autofocus requested; no focus record created")
+                depthFocusPoint = point
+                print("[Camera] hardware autofocus and next-photo depth focus requested")
             } catch {
                 print("[Camera] focus rejected: \(error.localizedDescription)")
             }
@@ -245,7 +222,10 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
                 settings.embedsPortraitEffectsMatteInPhoto = settings.isPortraitEffectsMatteDeliveryEnabled
 
                 let id = settings.uniqueID
-                pendingCapture = PendingCapture(id: id, options: options, depthRequested: useDepth,
+                let frozenOptions = DepthOptions(enabled: options.enabled, aperture: options.aperture,
+                                                 focusPoint: depthFocusPoint)
+                depthFocusPoint = nil
+                pendingCapture = PendingCapture(id: id, options: frozenOptions, depthRequested: useDepth,
                                                 continuation: continuation)
                 print("[Capture \(id)] depthRequested=\(useDepth), virtual f/\(options.aperture), angle=\(rotationAngle)")
                 photoOutput.capturePhoto(with: settings, delegate: self)
@@ -312,6 +292,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
     private func configureSession(for target: AVCaptureDevice.Position) throws {
         dispatchPrecondition(condition: .onQueue(sessionQueue))
         isConfigured = false
+        depthFocusPoint = nil
         session.beginConfiguration()
         defer { session.commitConfiguration() }
         session.sessionPreset = .photo

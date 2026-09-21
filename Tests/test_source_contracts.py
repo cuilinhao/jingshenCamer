@@ -41,7 +41,7 @@ class SourceContracts(unittest.TestCase):
 
     def test_no_focus_persistence_or_third_party_sources(self):
         source = '\n'.join(p.read_text() for p in APP.glob('*.swift'))
-        self.assertNotRegex(source, r'JSONEncoder|JSONDecoder|UserDefaults|write\(to:|inputFocusRect')
+        self.assertNotRegex(source, r'JSONEncoder|JSONDecoder|UserDefaults|write\(to:')
         for p in APP.rglob('*'):
             self.assertNotIn(p.suffix, ('.m', '.mm', '.cpp', '.metal', '.mlmodel', '.mlpackage'))
         self.assertIn('camera.focus(at:', self.read('ViewController.swift'))
