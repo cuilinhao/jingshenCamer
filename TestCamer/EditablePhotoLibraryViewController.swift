@@ -1,5 +1,7 @@
 import UIKit
 import ImageIO
+import PhotosUI
+import UniformTypeIdentifiers
 
 /// 本机保留的原图和编辑参数；系统相册里的导出成片独立管理。
 @MainActor
@@ -9,6 +11,11 @@ final class EditablePhotoLibraryViewController: UITableViewController {
     private var operationTask: Task<Void, Never>?
     private var isBusy = false
     private var isClosed = false
+    private let importer = PhotoLibraryImporter()
+    private var isPickingPhoto = false
+    private var importID: UUID?
+    private var importProgress: Progress?
+    private let emptyMessage = "还没有可编辑照片\n可从右上角“系统相册”选择照片，或拍摄景深照片后继续编辑。"
     private let thumbnailCache = NSCache<NSURL, UIImage>()
     private let statusLabel = UILabel()
     private let statusSpinner = UIActivityIndicatorView(style: .medium)
@@ -36,10 +43,7 @@ final class EditablePhotoLibraryViewController: UITableViewController {
         // 使用明确的“完成”入口，避免磁盘操作结束后向已关闭页面推入编辑器。
         isModalInPresentation = true
         navigationController?.isModalInPresentation = true
-        navigationItem.leftBarButtonItem = UIBarButtonItem(title: "完成", style: .done,
-                                                           target: self, action: #selector(closeTapped))
-        navigationItem.rightBarButtonItem = UIBarButtonItem(barButtonSystemItem: .refresh,
-                                                            target: self, action: #selector(reloadTapped))
+        setBusy(false)
         tableView.register(EditablePhotoCell.self, forCellReuseIdentifier: EditablePhotoCell.reuseIdentifier)
         tableView.rowHeight = UITableView.automaticDimension
         tableView.estimatedRowHeight = 106
@@ -80,13 +84,14 @@ final class EditablePhotoLibraryViewController: UITableViewController {
         if isBeingDismissed || navigationController?.isBeingDismissed == true {
             isClosed = true
             operationTask?.cancel()
+            importProgress?.cancel()
         }
     }
 
     @objc private func reloadTapped() { reloadPhotos() }
 
     private func reloadPhotos() {
-        guard !isBusy, !isClosed else { return }
+        guard !isBusy, !isClosed, !isPickingPhoto else { return }
         setBusy(true, message: "正在读取本机照片…")
         operationTask = Task { [weak self] in
             guard let self else { return }
@@ -96,7 +101,7 @@ final class EditablePhotoLibraryViewController: UITableViewController {
                 photos = entries
                 setBusy(false)
                 tableView.reloadData()
-                setBackground(message: entries.isEmpty ? "还没有可编辑照片\n拍摄景深照片后，可在这里继续换焦和调整光圈。" : nil)
+                restoreListBackground()
             } catch {
                 guard !isClosed, !Task.isCancelled else { return }
                 setBusy(false)
@@ -109,6 +114,97 @@ final class EditablePhotoLibraryViewController: UITableViewController {
             }
             operationTask = nil
         }
+    }
+
+    @objc private func importTapped() {
+        guard !isBusy, !isClosed, !isPickingPhoto, presentedViewController == nil else { return }
+        var configuration = PHPickerConfiguration()
+        configuration.filter = .images
+        configuration.selectionLimit = 1
+        // 尽可能保留 HEIC 容器及深度附件，避免先转成 UIImage/JPEG 丢失数据。
+        configuration.preferredAssetRepresentationMode = .current
+        let picker = PHPickerViewController(configuration: configuration)
+        picker.delegate = self
+        isPickingPhoto = true
+        present(picker, animated: true)
+        picker.presentationController?.delegate = self
+    }
+
+    private func importPhoto(from provider: NSItemProvider) {
+        guard !isBusy, !isClosed else { return }
+        guard provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) else {
+            showError(title: "无法导入照片", message: "请选择支持的图片文件。")
+            return
+        }
+        let id = UUID()
+        importID = id
+        setBusy(true, message: "正在读取相册照片…")
+        operationTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let data = try await loadPhotoData(from: provider)
+                try Task.checkCancellation()
+                guard !isClosed, importID == id else { return }
+                importProgress = nil
+                setBusy(true, message: "正在准备景深编辑…")
+                let imported = try await importer.prepare(data: data)
+                try Task.checkCancellation()
+                guard !isClosed, importID == id else { return }
+                // 写入开始后暂时禁止取消，避免已保存的照片被误认为取消导入。
+                importID = nil
+                setBusy(true, message: "正在保存本机照片…")
+                var saveError: String?
+                do { try await store.save(imported.document) }
+                catch { saveError = error.localizedDescription }
+                guard !isClosed, !Task.isCancelled else { return }
+                setBusy(false)
+                restoreListBackground()
+                operationTask = nil
+                let editor = PhotoEditorViewController(document: imported.document, store: store,
+                    originalPreviewData: imported.originalPreviewData, initialSaveError: saveError)
+                navigationController?.pushViewController(editor, animated: true)
+            } catch {
+                guard !isClosed, importID == id else { return }
+                finishImport()
+                if !(error is CancellationError) {
+                    showError(title: "无法导入照片", message: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func loadPhotoData(from provider: NSItemProvider) async throws -> Data {
+        try await withCheckedThrowingContinuation { continuation in
+            importProgress = provider.loadFileRepresentation(forTypeIdentifier: UTType.image.identifier) { url, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else if let url {
+                    // 系统临时 URL 只在回调内有效；在回调结束前读完，后台不重编码。
+                    continuation.resume(with: Result { try Data(contentsOf: url) })
+                } else {
+                    continuation.resume(throwing: CocoaError(.fileReadUnknown))
+                }
+            }
+        }
+    }
+
+    @objc private func cancelImportTapped() {
+        guard importID != nil else { return }
+        operationTask?.cancel()
+        importProgress?.cancel()
+        finishImport()
+    }
+
+    private func finishImport() {
+        importID = nil
+        importProgress = nil
+        operationTask = nil
+        setBusy(false)
+        restoreListBackground()
+    }
+
+    private func restoreListBackground() {
+        setBackground(message: photos.isEmpty ? emptyMessage : nil)
     }
 
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int { photos.count }
@@ -200,7 +296,7 @@ final class EditablePhotoLibraryViewController: UITableViewController {
                 photos.removeAll { $0.id == id }
                 setBusy(false)
                 tableView.reloadData()
-                setBackground(message: photos.isEmpty ? "还没有可编辑照片\n拍摄景深照片后，可在这里继续换焦和调整光圈。" : nil)
+                restoreListBackground()
             } catch {
                 guard !isClosed, !Task.isCancelled else { return }
                 setBusy(false)
@@ -213,21 +309,27 @@ final class EditablePhotoLibraryViewController: UITableViewController {
 
     private func setBusy(_ busy: Bool, message: String? = nil) {
         isBusy = busy
-        navigationItem.leftBarButtonItem?.isEnabled = !busy
-        navigationItem.rightBarButtonItem?.isEnabled = !busy
+        navigationItem.prompt = busy ? message : nil
+        navigationItem.leftBarButtonItem = UIBarButtonItem(
+            title: importID == nil ? "完成" : "取消导入", style: .done, target: self,
+            action: importID == nil ? #selector(closeTapped) : #selector(cancelImportTapped))
+        navigationItem.leftBarButtonItem?.isEnabled = !busy || importID != nil
         tableView.isUserInteractionEnabled = !busy
         if busy {
             if photos.isEmpty { setBackground(message: message) }
-            else {
-                let spinner = UIActivityIndicatorView(style: .medium)
-                spinner.startAnimating()
-                navigationItem.rightBarButtonItem = UIBarButtonItem(customView: spinner)
-            }
+            let spinner = UIActivityIndicatorView(style: .medium)
+            spinner.startAnimating()
+            navigationItem.rightBarButtonItems = [UIBarButtonItem(customView: spinner)]
             statusSpinner.startAnimating()
         } else {
             statusSpinner.stopAnimating()
-            navigationItem.rightBarButtonItem = UIBarButtonItem(barButtonSystemItem: .refresh,
-                                                                target: self, action: #selector(reloadTapped))
+            let importButton = UIBarButtonItem(title: "系统相册", style: .plain,
+                                               target: self, action: #selector(importTapped))
+            importButton.accessibilityIdentifier = "importPhotoFromLibrary"
+            let refreshButton = UIBarButtonItem(barButtonSystemItem: .refresh,
+                                                target: self, action: #selector(reloadTapped))
+            refreshButton.accessibilityLabel = "刷新本机照片"
+            navigationItem.rightBarButtonItems = [importButton, refreshButton]
         }
     }
 
@@ -265,6 +367,26 @@ final class EditablePhotoLibraryViewController: UITableViewController {
             kCGImageSourceShouldCacheImmediately: true
         ]
         return Thumbnail(image: CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary))
+    }
+}
+
+extension EditablePhotoLibraryViewController: PHPickerViewControllerDelegate, UIAdaptivePresentationControllerDelegate {
+    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        if presentationController.presentedViewController is PHPickerViewController {
+            isPickingPhoto = false
+        }
+    }
+
+    func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+        guard isPickingPhoto else { return }
+        // 等系统选择器完成关闭再推入编辑器，取消选择不改变本机列表。
+        picker.dismiss(animated: true) { [weak self] in
+            guard let self, !isClosed else { return }
+            isPickingPhoto = false
+            if let selection = results.first {
+                importPhoto(from: selection.itemProvider)
+            }
+        }
     }
 }
 
