@@ -5,16 +5,18 @@ import UIKit
 final class DepthDiagnosticsViewController: UIViewController {
     private let text: String
     private let maskData: Data?
+    private let isOutputDifference: Bool
 
-    init(text: String, maskData: Data?) {
+    init(text: String, maskData: Data?, isOutputDifference: Bool = false) {
         self.text = text; self.maskData = maskData
+        self.isOutputDifference = isOutputDifference
         super.init(nibName: nil, bundle: nil)
     }
     required init?(coder: NSCoder) { nil }
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        title = "景深诊断 · v2"
+        title = "景深诊断 · v3"
         view.backgroundColor = .systemBackground
         navigationItem.leftBarButtonItem = UIBarButtonItem(title: "完成", style: .done,
                                                            target: self, action: #selector(close))
@@ -42,7 +44,10 @@ final class DepthDiagnosticsViewController: UIViewController {
         let explanation = UILabel()
         explanation.font = .preferredFont(forTextStyle: .body)
         explanation.numberOfLines = 0
-        explanation.text = "下方是本次处理实际使用的主要虚化分布，不是拍摄预览。白色越亮，虚化半径越大；黑色表示保留清晰或深度无效。\n\n诊断文字会写入 TestLog，可从拍摄页右上角导出；不写入照片，也不记录聚焦坐标。"
+        let imageExplanation = isOutputDifference
+            ? "下方是成片与原图的像素差异图（放大 4 倍）。越亮表示变化越大；黑色表示变化较小。它不是苹果滤镜的内部虚化遮罩，也不能单独证明画质合格。"
+            : "下方是旧版处理实际使用的虚化分布。白色越亮，虚化半径越大；黑色表示保留清晰或深度无效。"
+        explanation.text = imageExplanation + "\n\n诊断文字会写入 TestLog，可从拍摄页右上角导出；不写入照片，也不记录聚焦坐标。"
         stack.addArrangedSubview(explanation)
         if let maskData, let image = UIImage(data: maskData) {
             let imageView = UIImageView(image: image)
@@ -55,7 +60,7 @@ final class DepthDiagnosticsViewController: UIViewController {
                                               multiplier: image.size.height/max(1, image.size.width)).isActive = true
         } else {
             let missing = UILabel()
-            missing.text = "本次没有生成虚化分布图，请查看下面的具体原因。"
+            missing.text = "本次没有生成诊断图，请查看下面的具体原因。"
             missing.numberOfLines = 0
             missing.textColor = .systemOrange
             stack.addArrangedSubview(missing)

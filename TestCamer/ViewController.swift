@@ -17,6 +17,7 @@ final class ViewController: UIViewController {
     private var lastZoomFactor: CGFloat = 1
     private var capturedImage: UIImage?
     private var originalComparisonImage: UIImage?
+    private var legacyComparisonImage: UIImage?
     private var processedPhoto: ProcessedPhoto?
     private let processor = DepthPhotoProcessor()
     private var cameraState: CameraState?
@@ -36,6 +37,7 @@ final class ViewController: UIViewController {
     private let apertureLabel = UILabel()
     private let resultInfoLabel = UILabel()
     private let compareButton = UIButton(type: .system)
+    private let legacyCompareButton = UIButton(type: .system)
     private let diagnosticsButton = UIButton(type: .system)
     private let comparisonControls = UIStackView()
     private let retryButton = UIButton(type: .system)
@@ -275,12 +277,15 @@ private extension ViewController {
             do {
                 let payload = try await camera.capturePhoto(flashMode: flashMode, options: options,
                                                            rotationAngle: rotation, mirrored: mirrored)
-                statusLabel.text = payload.depthRequested ? "正在生成景深成片…" : "正在生成照片…"
-                let result = try await processor.process(payload)
+                statusLabel.text = payload.depthRequested ? "正在生成苹果景深与同帧对比…" : "正在生成照片…"
+                let result = try await processor.process(payload, includeLegacyComparison: true)
                 guard let image = UIImage(data: result.previewData) else { throw CameraError.captureFailed }
                 TestLog.shared.record("result displayed outcome=\(result.outcome.rawValue), dimensions=\(result.pixelWidth)x\(result.pixelHeight)", category: "ui", captureID: result.captureID)
                 processedPhoto = result
                 originalComparisonImage = UIImage(data: result.originalPreviewData)
+                legacyComparisonImage = result.legacyComparison.flatMap {
+                    $0.outcome.canCompare ? UIImage(data: $0.previewData) : nil
+                }
                 statusLabel.isHidden = true
                 showCapturedImage(image)
             } catch {
@@ -330,6 +335,7 @@ private extension ViewController {
         TestLog.shared.record("retake requested", category: "ui", captureID: processedPhoto?.captureID)
         capturedImage = nil
         originalComparisonImage = nil
+        legacyComparisonImage = nil
         processedPhoto = nil
         capturedImageView.image = nil
         capturedImageView.isHidden = true
@@ -379,18 +385,30 @@ private extension ViewController {
     @objc func beginComparison() {
         guard !isSaving, processedPhoto?.outcome.canCompare == true else { return }
         capturedImageView.image = originalComparisonImage
-        compareButton.configuration?.title = "原图 · 松开看成片"
+        resultInfoLabel.text = "原图 · 松开恢复苹果景深\n同一次快门 · 未添加景深虚化"
+        legacyCompareButton.isEnabled = false
+    }
+
+    @objc func beginLegacyComparison() {
+        guard !isSaving, let image = legacyComparisonImage else { return }
+        capturedImageView.image = image
+        resultInfoLabel.text = "旧版对比 · 松开恢复当前成片\n同一次快门 · 相同光圈与选焦"
+        compareButton.isEnabled = false
     }
 
     @objc func endComparison() {
         capturedImageView.image = capturedImage
         compareButton.configuration?.title = "按住看原图"
+        updateResultDescription()
+        updateControlAvailability()
     }
 
     @objc func showDepthDiagnostics() {
         guard let photo = processedPhoto, !isSaving, presentedViewController == nil else { return }
         endComparison()
-        let screen = DepthDiagnosticsViewController(text: photo.diagnosticText, maskData: photo.diagnosticMaskData)
+        let comparison = photo.legacyComparison.map { "\n\n同帧旧版结果：\($0.outcome.message)" } ?? ""
+        let screen = DepthDiagnosticsViewController(text: photo.diagnosticText + comparison,
+            maskData: photo.diagnosticMaskData, isOutputDifference: photo.diagnosticImageIsDifference)
         let navigation = UINavigationController(rootViewController: screen)
         navigation.modalPresentationStyle = .pageSheet
         navigation.sheetPresentationController?.detents = [.large()]
@@ -613,13 +631,20 @@ private extension ViewController {
         retryButton.isHidden = true
         focusIndicator.alpha = 0
         if let photo = processedPhoto {
-            let aperture = photo.outcome.canCompare ? String(format: " · f/%.1f", photo.aperture) : ""
-            resultInfoLabel.text = "  \(photo.outcome.message)\(aperture)  \n  \(photo.pixelWidth) × \(photo.pixelHeight) · JPEG  "
+            updateResultDescription()
             compareButton.isHidden = !photo.outcome.canCompare
+            legacyCompareButton.isHidden = legacyComparisonImage == nil
             comparisonControls.isHidden = false
             resultInfoLabel.textColor = photo.outcome.isDepthApplied ? .white : .systemYellow
         }
         camera.stop()
+    }
+
+    func updateResultDescription() {
+        guard let photo = processedPhoto else { return }
+        let aperture = photo.outcome.canCompare ? String(format: " · f/%.1f", photo.aperture) : ""
+        let title = photo.outcome.canCompare ? "\(photo.rendererTitle) · \(photo.outcome.message)" : photo.outcome.message
+        resultInfoLabel.text = "  \(title)\(aperture)  \n  \(photo.pixelWidth) × \(photo.pixelHeight) · JPEG  "
     }
 
     func flashScreen() {
@@ -708,7 +733,7 @@ private extension ViewController {
         depthPanel.clipsToBounds = true
         view.addSubview(depthPanel)
 
-        depthTitleLabel.text = "拍后景深 · v2"
+        depthTitleLabel.text = "苹果景深 · v3"
         depthTitleLabel.font = .systemFont(ofSize: 16, weight: .semibold)
         depthTitleLabel.textColor = .white
         depthHintLabel.font = .systemFont(ofSize: 12)
@@ -720,7 +745,7 @@ private extension ViewController {
 
         apertureSlider.minimumValue = 0
         apertureSlider.maximumValue = Float(DepthCapturePolicy.apertures.count - 1)
-        apertureSlider.value = 1
+        apertureSlider.value = 0 // 从参考照片使用的 f/1.4 开始。
         apertureSlider.minimumTrackTintColor = .systemYellow
         apertureSlider.accessibilityLabel = "虚拟光圈，仅成片生效"
         apertureSlider.addTarget(self, action: #selector(apertureChanged), for: .valueChanged)
@@ -757,12 +782,26 @@ private extension ViewController {
         compareButton.addTarget(self, action: #selector(endComparison),
                                 for: [.touchUpOutside, .touchCancel, .touchDragExit])
         compareButton.isHidden = true
+        configureTextButton(legacyCompareButton, title: "按住看旧版", action: #selector(endComparison))
+        legacyCompareButton.addTarget(self, action: #selector(beginLegacyComparison), for: [.touchDown, .touchDragEnter])
+        legacyCompareButton.addTarget(self, action: #selector(endComparison),
+                                      for: [.touchUpOutside, .touchCancel, .touchDragExit])
+        legacyCompareButton.isHidden = true
         configureTextButton(diagnosticsButton, title: "景深诊断", action: #selector(showDepthDiagnostics))
+        for button in [compareButton, legacyCompareButton, diagnosticsButton] {
+            button.configuration?.contentInsets = NSDirectionalEdgeInsets(top: 10, leading: 6, bottom: 10, trailing: 6)
+            button.configuration?.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer {
+                var attributes = $0
+                attributes[AttributeScopes.UIKitAttributes.FontAttribute.self] = UIFont.systemFont(ofSize: 13, weight: .medium)
+                return attributes
+            }
+        }
         comparisonControls.axis = .horizontal
         comparisonControls.distribution = .fillEqually
         comparisonControls.spacing = 12
         comparisonControls.translatesAutoresizingMaskIntoConstraints = false
         comparisonControls.addArrangedSubview(compareButton)
+        comparisonControls.addArrangedSubview(legacyCompareButton)
         comparisonControls.addArrangedSubview(diagnosticsButton)
         comparisonControls.isHidden = true
         view.addSubview(comparisonControls)
@@ -806,13 +845,13 @@ private extension ViewController {
         let supported = cameraState?.depthSupported == true
         let active = supported && wantsDepth
         depthSwitch.setOn(active, animated: false)
-        depthTitleLabel.text = supported ? "拍后景深 · v2" : "普通拍照 · v2"
+        depthTitleLabel.text = supported ? "苹果景深 · v3" : "普通拍照 · v3"
         if cameraState == nil {
             depthHintLabel.text = "正在检测当前相机的原生深度能力…"
         } else if !supported {
             depthHintLabel.text = "当前相机不支持原生深度，仍可普通拍照。"
         } else {
-            depthHintLabel.text = active ? "预览不虚化 · 请点选主体后拍摄\n仅本次选焦，不保存聚焦位置" : "景深已关闭 · 成片不添加算法虚化"
+            depthHintLabel.text = active ? "点选清晰主体后拍摄 · 成片生成景深\n拍完可按住对比原图和旧版效果" : "景深已关闭 · 成片不添加算法虚化"
         }
         let aperture = DepthCapturePolicy.aperture(sliderValue: apertureSlider.value)
         apertureLabel.text = String(format: "f/%.1f", aperture)
@@ -834,6 +873,7 @@ private extension ViewController {
         retakeButton.isEnabled = !isSaving && !isCapturing
         saveButton.isEnabled = processedPhoto != nil && !isSaving && !isCapturing
         compareButton.isEnabled = !isSaving
+        legacyCompareButton.isEnabled = !isSaving
         diagnosticsButton.isEnabled = processedPhoto != nil && !isSaving
         updateDepthPanel()
     }

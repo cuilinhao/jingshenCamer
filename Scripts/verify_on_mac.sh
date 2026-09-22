@@ -14,4 +14,5 @@ echo "构建产物与日志目录：$BUILD_ROOT"
 # 不签名的通用真机 SDK 构建，用来检查 iOS API、Swift 类型和资源编译。
 xcodebuild -project "$ROOT/TestCamer.xcodeproj" -scheme TestCamer   -configuration Debug -destination 'generic/platform=iOS'   -derivedDataPath "$BUILD_ROOT/DerivedData" CODE_SIGNING_ALLOWED=NO build   2>&1 | tee "$BUILD_ROOT/build.log"
 bash "$ROOT/Scripts/verify_render_on_mac.sh"
+bash "$ROOT/Scripts/verify_apple_depth_on_mac.sh"
 echo "SDK 构建和合成图像渲染测试完成。请继续用 Xcode 签名运行到真机，按 Documentation/真机验收.md 验证。"

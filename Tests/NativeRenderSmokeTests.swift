@@ -5,6 +5,7 @@ import CoreImage
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
+import AVFoundation
 
 @main
 struct NativeRenderSmokeTests {
@@ -164,9 +165,20 @@ struct NativeRenderSmokeTests {
         let png = try encodePNG(fixture.image)
         let snapshot = NativeDepthSnapshot(raster: fixture.depth, quality: "synthetic", accuracy: "relative", filtered: true)
         let processor = DepthPhotoProcessor()
+        // 默认苹果路径需要保留原生辅助元数据的采集容器；不得偷偷使用旧版算法冒充。
+        let noContainer = try await processor.process(CapturedPhoto(data: png, depthRequested: true,
+            hasDepthData: true, nativeDepth: snapshot, options: DepthOptions(enabled: true, aperture: 1.4),
+            transientDeviceFocus: NormalizedImagePoint(x: 0.5, y: 0.5), captureSummary: "missing native auxiliary container"),
+            includeLegacyComparison: true)
+        expect(noContainer.outcome == .renderFailed,
+               "Default renderer never silently substitutes legacy blur when Apple input is missing")
+        expect(noContainer.diagnosticMaskData == nil,
+               "Failed Apple rendering never publishes a fabricated blur mask")
+        expect(noContainer.legacyComparison?.outcome == .applied,
+               "Same-frame legacy comparison remains available without replacing failed Apple output")
         let valid = try await processor.process(CapturedPhoto(data: png, depthRequested: true,
             hasDepthData: true, nativeDepth: snapshot, options: DepthOptions(enabled: true, aperture: 1.4),
-            transientDeviceFocus: NormalizedImagePoint(x: 0.5, y: 0.5), captureSummary: "synthetic renderer fixture"))
+            transientDeviceFocus: NormalizedImagePoint(x: 0.5, y: 0.5), captureSummary: "synthetic renderer fixture"), renderer: .legacy)
         expect(valid.outcome == .applied, "Full pipeline sees measurable output change without embedded depth")
         expect(valid.diagnosticMaskData != nil, "Diagnostic mask comes from actual render")
         expect(valid.pixelWidth == 400 && valid.pixelHeight == 300, "Export size matches captured image")
@@ -184,14 +196,43 @@ struct NativeRenderSmokeTests {
             transientDeviceFocus: nil, captureSummary: "synthetic missing-depth case"))
         expect(missing.outcome == .missingDepth, "Missing depth reports ordinary-photo fallback")
         expect(missing.diagnosticMaskData == nil, "Missing depth does not fabricate a mask")
+        expect(noContainer.jpegData == missing.jpegData,
+               "Saving after legacy comparison still saves the primary ordinary-photo fallback")
+        expect(noContainer.legacyComparison?.previewData != missing.previewData,
+               "Legacy comparison contains a separately rendered preview, not a copy of the primary")
         let disabled = try await processor.process(CapturedPhoto(data: png, depthRequested: false,
             hasDepthData: false, nativeDepth: nil, options: DepthOptions(enabled: false, aperture: 1.4),
             transientDeviceFocus: nil, captureSummary: "synthetic disabled case"))
         expect(disabled.outcome == .disabled, "User disabling depth is preserved")
         let plainUniform = try await processor.process(CapturedPhoto(data: encodePNG(uniform.image), depthRequested: true,
             hasDepthData: true, nativeDepth: snapshot, options: DepthOptions(enabled: true, aperture: 1.4),
-            transientDeviceFocus: NormalizedImagePoint(x: 0.5, y: 0.5), captureSummary: "synthetic uniform-color case"))
+            transientDeviceFocus: NormalizedImagePoint(x: 0.5, y: 0.5), captureSummary: "synthetic uniform-color case"), renderer: .legacy)
         expect(plainUniform.outcome == .weakEffect, "Uniform background is not falsely labelled visibly changed")
+
+        // 真实编码的同帧 RGB + disparity 容器走默认苹果路径，而非只测适配器。
+        let appleInput = try AppleDepthTestFixture.photo(context: context)
+        let appleSource = CGImageSourceCreateWithData(appleInput as CFData, nil)!
+        let appleAuxiliary = CGImageSourceCopyAuxiliaryDataInfoAtIndex(appleSource, 0,
+            kCGImageAuxiliaryDataTypeDisparity)! as! [AnyHashable: Any]
+        let appleSnapshot = try NativeDepthSnapshot(depthData: AVDepthData(fromDictionaryRepresentation: appleAuxiliary))
+        let applePhoto = CapturedPhoto(data: appleInput, depthRequested: true, hasDepthData: true,
+            nativeDepth: appleSnapshot, options: DepthOptions(enabled: true, aperture: 1.4),
+            transientDeviceFocus: .init(x: 0.22, y: 0.27), captureSummary: "unblurred same-frame Apple fixture")
+        let appleResult = try await processor.process(applePhoto, includeLegacyComparison: true)
+        expect(appleResult.outcome == .applied, "Default Apple pipeline produces measured changes from native auxiliary data")
+        expect(appleResult.legacyComparison?.outcome == .applied, "Same-frame legacy renderer runs independently")
+        expect(appleResult.legacyComparison?.previewData != appleResult.previewData,
+               "Apple and legacy comparison previews contain their respective rendered output")
+        expect(appleResult.pixelWidth == 768 && appleResult.pixelHeight == 512,
+               "Apple processing preserves complete capture dimensions")
+        expect(appleResult.diagnosticMaskData != nil && appleResult.diagnosticImageIsDifference,
+               "Apple diagnostic explicitly identifies an output difference image")
+        let appleExport = CGImageSourceCreateWithData(appleResult.jpegData as CFData, nil)!
+        expect(CGImageSourceCopyAuxiliaryDataInfoAtIndex(appleExport, 0, kCGImageAuxiliaryDataTypeDisparity) == nil,
+               "Apple input disparity is stripped from the baked JPEG export")
+        let appleProperties = CGImageSourceCopyPropertiesAtIndex(appleExport, 0, nil) as? [String: Any] ?? [:]
+        expect(appleProperties[kCGImagePropertyMakerAppleDictionary as String] == nil,
+               "Apple rendering does not persist private focus/camera metadata")
         print("\n\(checks) native checks; \(failures) failures. These are synthetic tests, NOT an iPhone camera test.")
         if failures > 0 { exit(1) }
     }

@@ -7,6 +7,13 @@
 //
 import Foundation
 
+enum DepthRenderingMethod: String, Sendable {
+    case apple
+    case legacy
+
+    var title: String { self == .apple ? "苹果景深" : "旧版景深" }
+}
+
 struct DepthOptions: Sendable, Equatable {
     let enabled: Bool
     let aperture: Float
@@ -34,7 +41,7 @@ enum DepthRenderOutcome: String, Sendable {
 
     var message: String {
         switch self {
-        case .applied: return "景深成片 · 已检测到图像变化"
+        case .applied: return "已生成景深成片"
         case .weakEffect: return "已处理 · 本次可见变化较弱，请查看诊断"
         case .disabled: return "普通照片 · 景深已关闭"
         case .unsupported: return "普通照片 · 当前相机不支持原生深度"

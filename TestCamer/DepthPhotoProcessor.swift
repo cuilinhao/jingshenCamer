@@ -1,4 +1,4 @@
-// DepthPhotoProcessor.swift — v2
+// DepthPhotoProcessor.swift — 苹果公开景深与同帧旧版对照
 // 只处理一次快门的照片，不参与普通取景。原图/深度/瞬时选焦只存在本次内存任务中。
 import Foundation
 import CoreImage
@@ -20,6 +20,19 @@ struct ProcessedPhoto: Sendable {
     let pixelWidth: Int
     let pixelHeight: Int
     let captureID: Int64?
+    let renderer: DepthRenderingMethod
+    let usedAppleMetadataCompatibility: Bool
+    let diagnosticImageIsDifference: Bool
+    var legacyComparison: LegacyDepthComparison? = nil
+
+    var rendererTitle: String {
+        usedAppleMetadataCompatibility ? "苹果景深（兼容）" : renderer.title
+    }
+}
+
+struct LegacyDepthComparison: Sendable {
+    let previewData: Data
+    let outcome: DepthRenderOutcome
 }
 
 /// CIContext 与可变渲染状态仅由 renderQueue 使用。异步调用不阻塞相机/UI 主线程。
@@ -28,7 +41,8 @@ final class DepthPhotoProcessor: @unchecked Sendable {
     private let context = CIContext(options: [.cacheIntermediates: false])
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
 
-    func process(_ photo: CapturedPhoto) async throws -> ProcessedPhoto {
+    func process(_ photo: CapturedPhoto, renderer: DepthRenderingMethod = .apple,
+                 includeLegacyComparison: Bool = false) async throws -> ProcessedPhoto {
         let queued = ProcessInfo.processInfo.systemUptime
         TestLog.shared.record("process queued bytes=\(photo.data.count) enabled=\(photo.options.enabled) " +
             "depthRequested=\(photo.depthRequested) hasDepth=\(photo.hasDepthData) " +
@@ -38,7 +52,24 @@ final class DepthPhotoProcessor: @unchecked Sendable {
             renderQueue.async { [self] in
                 TestLog.shared.record(String(format: "process started queueSeconds=%.3f",
                     ProcessInfo.processInfo.systemUptime - queued), category: "processor", captureID: photo.captureID)
-                let result: Result<ProcessedPhoto, Error> = autoreleasepool { Result { try render(photo) } }
+                let result: Result<ProcessedPhoto, Error> = autoreleasepool {
+                    Result {
+                        var primary = try render(photo, renderer: renderer)
+                        if includeLegacyComparison, renderer == .apple, photo.options.enabled,
+                           photo.hasDepthData, photo.nativeDepth != nil {
+                            // 串行处理完全相同的输入；仅保留旧版预览，不能影响主结果或保存目标。
+                            do {
+                                let comparison = try autoreleasepool { try render(photo, renderer: .legacy) }
+                                primary.legacyComparison = LegacyDepthComparison(
+                                    previewData: comparison.previewData, outcome: comparison.outcome)
+                            } catch {
+                                TestLog.shared.record("legacy comparison failed: \(TestLog.errorDescription(error))",
+                                                      category: "processor", captureID: photo.captureID)
+                            }
+                        }
+                        return primary
+                    }
+                }
                 if case .failure(let error) = result {
                     TestLog.shared.record("process failed \(TestLog.errorDescription(error))",
                                           category: "processor", captureID: photo.captureID)
@@ -48,7 +79,7 @@ final class DepthPhotoProcessor: @unchecked Sendable {
         }
     }
 
-    private func render(_ photo: CapturedPhoto) throws -> ProcessedPhoto {
+    private func render(_ photo: CapturedPhoto, renderer: DepthRenderingMethod) throws -> ProcessedPhoto {
         dispatchPrecondition(condition: .onQueue(renderQueue))
         let started = Date()
         defer { context.clearCaches() }
@@ -90,13 +121,14 @@ final class DepthPhotoProcessor: @unchecked Sendable {
         }
         finish("raw=\(Int(rawImage.extent.width))x\(Int(rawImage.extent.height)) " +
                "upright=\(Int(original.extent.width))x\(Int(original.extent.height)) exif=\(orientation.rawValue)")
-        var notes = ["TestCamer PostCaptureDepth v2", photo.captureSummary,
+        var notes = ["TestCamer PostCaptureDepth v3", "requestedRenderer=\(renderer.rawValue)", photo.captureSummary,
                      "photoUpright=\(Int(original.extent.width))x\(Int(original.extent.height))",
                      "exifApplied=\(orientation.rawValue)",
                      String(format: "virtualAperture=f/%.1f", photo.options.aperture)]
         var outcome: DepthRenderOutcome = .renderFailed
         var outputCG: CGImage?
         var diagnosticMaskData: Data?
+        var usedAppleMetadataCompatibility = false
 
         if !photo.options.enabled {
             outcome = .disabled
@@ -118,29 +150,39 @@ final class DepthPhotoProcessor: @unchecked Sendable {
                 finish("size=\(depth.width)x\(depth.height) quality=\(nativeDepth.quality) " +
                        "accuracy=\(nativeDepth.accuracy) filtered=\(nativeDepth.filtered) " + depthStatistics(depth))
                 begin("subject_selection")
-                let uprightTap = photo.transientDeviceFocus?.oriented(exif: orientation.rawValue)
-                let subject = PortraitSubjectMask(context: context).select(in: original,
-                    nativeMatte: photo.nativePortraitMatte, exif: orientation.rawValue, tap: uprightTap,
+                // 两套算法采用相同的选焦规则。自动模式选最大可用人脸，否则中心；
+                // 苹果路径不再将整个选中人物用原图强行覆盖回去。
+                let selection = choosePlane(original: original, depth: depth,
+                    transientDeviceFocus: photo.transientDeviceFocus, exif: orientation.rawValue,
                     captureID: photo.captureID)
-                let selection: (point: NormalizedImagePoint?, isPerson: Bool, source: String)
-                if let subject {
-                    selection = (subject.focusPoint, true, subject.source)
-                } else {
-                    selection = choosePlane(original: original, depth: depth,
-                        transientDeviceFocus: photo.transientDeviceFocus, exif: orientation.rawValue,
-                        captureID: photo.captureID)
-                }
+                let focus = selection.point ?? NormalizedImagePoint(x: 0.5, y: 0.5)
                 notes.append("selection=\(selection.source)") // 不记录点位或人脸框。
-                finish("source=\(selection.source) isPerson=\(selection.isPerson) protectedSubject=\(subject != nil)")
-                begin("depth_plan")
-                let plan = try DepthMath.makePlan(depth: depth, focus: selection.point,
-                                                 isPerson: selection.isPerson, aperture: photo.options.aperture)
-                notes.append(String(format: "validDepth=%.1f%%", plan.validFraction*100))
-                finish(String(format: "validDepth=%.2f%% nearCoverage=%.2f%% farCoverage=%.2f%%",
-                              plan.validFraction * 100, plan.nearFraction * 100, plan.farFraction * 100))
-                begin("render_graph")
-                let renderer = DepthBlurRenderer(context: context, colorSpace: colorSpace)
-                let result = try renderer.render(original: original, plan: plan, protectedSubject: subject?.mask)
+                finish("source=\(selection.source)")
+                let result: DepthBlurOutput
+                if renderer == .apple {
+                    begin("apple_depth_render")
+                    let inverseEXIF: UInt32 = exif == 6 ? 8 : (exif == 8 ? 6 : exif)
+                    let sensorFocus = focus.oriented(exif: inverseEXIF)
+                    let apple = try AppleDepthRenderer(context: context).render(photoData: photo.data,
+                        aperture: photo.options.aperture, sensorFocus: sensorFocus)
+                    usedAppleMetadataCompatibility = apple.usedMetadataCompatibility
+                    guard apple.image.extent == original.extent else { throw DepthAnalysisError.alignmentMismatch }
+                    // 官方滤镜没有公开其内部虚化量图。全图仅用于输出变化统计，
+                    // 下方诊断另生成差异图，不能把白色统计选区冒充其实际遮罩。
+                    let measurementArea = CIImage(color: CIColor(red: 1, green: 1, blue: 1))
+                        .cropped(to: original.extent)
+                    result = DepthBlurOutput(image: apple.image, amountMask: measurementArea,
+                        notes: apple.notes + "\nmeasurementScope=whole image\nwholePersonCompositing=false")
+                } else {
+                    begin("legacy_depth_render")
+                    let subject = PortraitSubjectMask(context: context).select(in: original,
+                        nativeMatte: photo.nativePortraitMatte, exif: orientation.rawValue, tap: focus,
+                        captureID: photo.captureID)
+                    let plan = try DepthMath.makePlan(depth: depth, focus: focus,
+                        isPerson: subject != nil || selection.isPerson, aperture: photo.options.aperture)
+                    result = try DepthBlurRenderer(context: context, colorSpace: colorSpace)
+                        .render(original: original, plan: plan, protectedSubject: subject?.mask)
+                }
                 notes.append(result.notes)
                 finish(result.notes)
                 begin("materialize_output")
@@ -163,7 +205,21 @@ final class DepthPhotoProcessor: @unchecked Sendable {
                     measurement.eligiblePixelCount, measurement.meanAbsoluteChange * 255,
                     measurement.changedFraction * 100, outcome.rawValue))
                 begin("diagnostic_preview")
-                diagnosticMaskData = try? previewJPEG(result.amountMask, maximum: 1200)
+                if renderer == .apple {
+                    let difference = CIImage(cgImage: cg).applyingFilter("CIDifferenceBlendMode",
+                        parameters: [kCIInputBackgroundImageKey: original])
+                        .applyingFilter("CIMaximumComponent")
+                        .applyingFilter("CIColorMatrix", parameters: [
+                            "inputRVector": CIVector(x: 4, y: 0, z: 0, w: 0),
+                            "inputGVector": CIVector(x: 0, y: 4, z: 0, w: 0),
+                            "inputBVector": CIVector(x: 0, y: 0, z: 4, w: 0)
+                        ]).cropped(to: original.extent)
+                    diagnosticMaskData = try? previewJPEG(difference, maximum: 1200)
+                    notes.append("diagnosticImage=output difference amplified 4x; not Apple's internal blur mask")
+                } else {
+                    diagnosticMaskData = try? previewJPEG(result.amountMask, maximum: 1200)
+                    notes.append("diagnosticImage=legacy blur amount")
+                }
                 finish("available=\(diagnosticMaskData != nil) bytes=\(diagnosticMaskData?.count ?? 0)")
             } catch let error as DepthAnalysisError {
                 log("stage failed=\(stage) \(TestLog.errorDescription(error))")
@@ -209,13 +265,15 @@ final class DepthPhotoProcessor: @unchecked Sendable {
         notes += ["outcome=\(outcome.rawValue)", String(format: "processingSeconds=%.2f", Date().timeIntervalSince(started)),
                   "jpegSize=\(jpeg.count) bytes", "savedFocusMetadata=false", "savedDepthMetadata=false"]
         let diagnosticText = notes.joined(separator: "\n")
-        print("[Depth v2]\n\(diagnosticText)")
+        print("[Depth v3]\n\(diagnosticText)")
         log("process complete outcome=\(outcome.rawValue)\n\(diagnosticText)")
         completed = true
         return ProcessedPhoto(jpegData: jpeg, previewData: preview, originalPreviewData: before,
                               diagnosticMaskData: diagnosticMaskData, diagnosticText: diagnosticText,
                               outcome: outcome, aperture: photo.options.aperture,
-                              pixelWidth: image.width, pixelHeight: image.height, captureID: photo.captureID)
+                              pixelWidth: image.width, pixelHeight: image.height, captureID: photo.captureID,
+                              renderer: renderer, usedAppleMetadataCompatibility: usedAppleMetadataCompatibility,
+                              diagnosticImageIsDifference: renderer == .apple)
     }
 
     /// 点按优先；未点按时，用人脸中心的深度或画面中心深度。Vision 只检测框，不做人像替换。
@@ -223,12 +281,12 @@ final class DepthPhotoProcessor: @unchecked Sendable {
     private func choosePlane(original: CIImage, depth: DepthRaster,
                              transientDeviceFocus: NormalizedImagePoint?, exif: UInt32, captureID: Int64?)
         -> (point: NormalizedImagePoint?, isPerson: Bool, source: String) {
-        let faceCenters = detectFaceCenters(original, captureID: captureID)
         if let devicePoint = transientDeviceFocus {
             let point = devicePoint.oriented(exif: exif)
             // 人物关联由同帧人物 mask 判定；相对视差值的比例不能判断是否同一个人。
             return (point, false, "本次点按（处理后不保留）")
         }
+        let faceCenters = detectFaceCenters(original, captureID: captureID)
         if let face = faceCenters.first(where: { depth.value(at: $0) != nil }) {
             return (face, true, "自动人脸深度平面")
         }
@@ -251,7 +309,7 @@ final class DepthPhotoProcessor: @unchecked Sendable {
                 .sorted { $0.boundingBox.width*$0.boundingBox.height > $1.boundingBox.width*$1.boundingBox.height }
                 .map { NormalizedImagePoint(x: Double($0.boundingBox.midX), y: Double(1-$0.boundingBox.midY)) }
         } catch {
-            print("[Depth v2] face detection unavailable; native depth still required")
+            print("[Depth v3] face detection unavailable; native depth still required")
             TestLog.shared.record("fallback face detection failed \(TestLog.errorDescription(error))",
                                   category: "processor", captureID: captureID)
             return []

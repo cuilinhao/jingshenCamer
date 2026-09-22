@@ -228,11 +228,16 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
                     && photoOutput.isDepthDataDeliveryEnabled
                 settings.isDepthDataDeliveryEnabled = useDepth
                 settings.isDepthDataFiltered = true
-                settings.embedsDepthDataInPhoto = false // 直接传 photo.depthData，不依赖编码容器附件。
+                // 仅内存容器保留原生深度和标定元数据，供苹果景深 factory 使用。
+                // 最终保存由处理器重新编码 JPEG，不复制这些附件。
+                settings.embedsDepthDataInPhoto = useDepth
                 settings.isPortraitEffectsMatteDeliveryEnabled = useDepth
                     && photoOutput.isPortraitEffectsMatteDeliverySupported
                     && photoOutput.isPortraitEffectsMatteDeliveryEnabled
-                settings.embedsPortraitEffectsMatteInPhoto = false
+                settings.embedsPortraitEffectsMatteInPhoto = settings.isPortraitEffectsMatteDeliveryEnabled
+                settings.enabledSemanticSegmentationMatteTypes = useDepth
+                    ? photoOutput.enabledSemanticSegmentationMatteTypes : []
+                settings.embedsSemanticSegmentationMattesInPhoto = useDepth
 
                 let transientFocus: NormalizedImagePoint?
                 if userDidTapFocus, let point = deviceInput?.device.focusPointOfInterest {
@@ -243,6 +248,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
                 pendingCapture = PendingCapture(id: id, options: options, depthRequested: useDepth, transientDeviceFocus: transientFocus,
                                                 continuation: continuation)
                 TestLog.shared.record("begin enabled=\(options.enabled), depthRequested=\(useDepth), nativeMatteRequested=\(settings.isPortraitEffectsMatteDeliveryEnabled), aperture=\(options.aperture), angle=\(rotationAngle), mirrored=\(mirrored), codec=\(codec.rawValue), flash=\(settings.flashMode.rawValue), tapFocus=\(transientFocus != nil)", category: "capture", captureID: id)
+                TestLog.shared.record("semanticMattesRequested=\(settings.enabledSemanticSegmentationMatteTypes.map(\.rawValue).joined(separator: ","))", category: "capture", captureID: id)
                 if let device = deviceInput?.device {
                     TestLog.shared.record("deviceType=\(device.deviceType.rawValue), position=\(device.position.rawValue), zoom=\(device.videoZoomFactor), focusMode=\(device.focusMode.rawValue), adjustingFocus=\(device.isAdjustingFocus), adjustingExposure=\(device.isAdjustingExposure), ISO=\(device.iso), exposureSeconds=\(device.exposureDuration.seconds)", category: "capture", captureID: id)
                 }
@@ -386,6 +392,9 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
         }
         photoOutput.isPortraitEffectsMatteDeliveryEnabled = photoOutput.isDepthDataDeliveryEnabled
             && photoOutput.isPortraitEffectsMatteDeliverySupported
+        let wantedMattes: [AVSemanticSegmentationMatte.MatteType] = [.hair, .glasses]
+        photoOutput.enabledSemanticSegmentationMatteTypes = photoOutput.isDepthDataDeliveryEnabled
+            ? photoOutput.availableSemanticSegmentationMatteTypes.filter { wantedMattes.contains($0) } : []
 
         // 使用当前格式真实支持的尺寸，优先约 12 MP，避免默认去做 48 MP 大内存景深渲染。
         let dimensions = device.activeFormat.supportedMaxPhotoDimensions.sorted {

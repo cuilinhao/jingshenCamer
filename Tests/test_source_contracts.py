@@ -11,7 +11,7 @@ class SourceContracts(unittest.TestCase):
         for token in ['photoOutput.isDepthDataDeliveryEnabled = true', 'settings.isDepthDataDeliveryEnabled =',
                       'settings.isDepthDataFiltered = true', 'NativeDepthSnapshot(depthData: depth)', 'photo.depthData']:
             self.assertIn(token, c)
-        self.assertIn('settings.embedsDepthDataInPhoto = false', c)
+        # 内存采集容器现在保留深度元数据；最终导出隐私由实际原生渲染测试验证。
         self.assertIn('photo.nativeDepth', self.read('DepthPhotoProcessor.swift'))
     def test_ordinary_preview_has_no_stream_processor(self):
         src = '\n'.join(p.read_text() for p in APP.glob('*.swift'))
@@ -32,7 +32,6 @@ class SourceContracts(unittest.TestCase):
             self.assertIn(token, c)
     def test_depth_renderer_and_explicit_fallback(self):
         p = self.read('DepthPhotoProcessor.swift')
-        self.assertNotIn('depthBlurEffectFilter', p)
         self.assertIn('depth.oriented', p.replace('nativeDepth.raster.oriented', 'depth.oriented'))
         self.assertIn('DepthMath.makePlan', p)
         self.assertIn('EffectMeasurement', p)
@@ -78,7 +77,7 @@ class SourceContracts(unittest.TestCase):
     def test_ios17_and_worker_isolation(self):
         proj = (ROOT/'TestCamer.xcodeproj/project.pbxproj').read_text()
         self.assertIn('IPHONEOS_DEPLOYMENT_TARGET = 17.0;', proj)
-        self.assertIn('CURRENT_PROJECT_VERSION = 2;', proj)
+        self.assertIn('CURRENT_PROJECT_VERSION = 3;', proj)
         self.assertNotIn('SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor', proj)
         self.assertNotIn('packageProductDependencies', proj)
         self.assertIn('windowScene?.interfaceOrientation', self.read('ViewController.swift'))
