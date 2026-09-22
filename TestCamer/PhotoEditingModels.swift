@@ -15,6 +15,12 @@ struct PhotoEditRecipe: Codable, Equatable, Sendable {
     }
 }
 
+/// 随当前预览保存的处理信息；旧照片缺少此信息时不推测回退原因。
+struct PhotoRenderingInfo: Codable, Equatable, Sendable {
+    let appleFallbackReason: String?
+    var usedAppleMetadataCompatibility: Bool
+}
+
 struct EditablePhotoDocument: Sendable {
     let id: UUID
     let createdAt: Date
@@ -25,9 +31,11 @@ struct EditablePhotoDocument: Sendable {
     var previewData: Data
     /// 与原图一起首次保存的传感器坐标视差附件，后续编辑不可替换。
     let depthData: Data?
+    var renderingInfo: PhotoRenderingInfo?
 
     init(id: UUID = UUID(), createdAt: Date = Date(), updatedAt: Date = Date(), sourceData: Data,
-         initialRecipe: PhotoEditRecipe, recipe: PhotoEditRecipe, previewData: Data, depthData: Data? = nil) {
+         initialRecipe: PhotoEditRecipe, recipe: PhotoEditRecipe, previewData: Data, depthData: Data? = nil,
+         renderingInfo: PhotoRenderingInfo? = nil) {
         self.id = id
         self.createdAt = createdAt
         self.updatedAt = updatedAt
@@ -36,6 +44,7 @@ struct EditablePhotoDocument: Sendable {
         self.recipe = recipe
         self.previewData = previewData
         self.depthData = depthData
+        self.renderingInfo = renderingInfo
     }
 }
 

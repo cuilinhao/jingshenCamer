@@ -99,6 +99,9 @@ struct DepthPlan: Sendable {
     let nearFraction: Double
     let farFraction: Double
     let aperture: Float
+    /// Only computational rendering supplies a selected instance. The interval
+    /// is learned from its reliable interior, not a full-person sharp cutout.
+    let subjectFocusRange: ClosedRange<Float>?
 
     var blurAmount: [Float] { zip(near, far).map { max($0, $1) } }
     func maxRadius(longEdge: Float) -> Float { DepthMath.radius(aperture: aperture, longEdge: longEdge) }
@@ -122,7 +125,12 @@ enum DepthMath {
     }
 
     static func makePlan(depth: DepthRaster, focus: NormalizedImagePoint?,
-                         isPerson: Bool, aperture: Float) throws -> DepthPlan {
+                         isPerson: Bool, aperture: Float,
+                         selectedSubjectConfidence: [Float]? = nil,
+                         selectedSubjectFace: NormalizedImagePoint? = nil) throws -> DepthPlan {
+        guard selectedSubjectConfidence.map({ $0.count == depth.values.count }) ?? true else {
+            throw DepthAnalysisError.invalidBuffer
+        }
         let valid = depth.values.filter { $0.isFinite && $0 > 0 }.sorted()
         let fraction = Double(valid.count) / Double(depth.values.count)
         guard valid.count >= 9, fraction >= 0.25 else { throw DepthAnalysisError.insufficientDepth }
@@ -146,6 +154,11 @@ enum DepthMath {
         // 人脸用于选取深度平面/略放宽清晰带，而非把整张人像抠出来。
         // 同一深度的椅背、桌面、另一个物体照样保持清晰。
         let clearBand: Float = (isPerson ? 0.11 : 0.055) + (f-1.4)/14.6 * 0.15
+        let subjectRange = selectedSubjectConfidence.flatMap {
+            subjectFocusRange(in: depth, confidence: $0, point: point, focal: focal,
+                              disparityScale: disparityScale, clearBand: clearBand,
+                              face: selectedSubjectFace)
+        }
         let transition: Float = 0.55
         var near = [Float](repeating: 0, count: depth.values.count)
         var far = near
@@ -157,7 +170,14 @@ enum DepthMath {
             // 这是在当前场景稳健跨度上标定的视觉效果量，不是到主体的距离比例。
             // AVDepthData.relative 可含视差偏移；仅差值和跨度对该偏移不敏感。
             let signedDifference = (d-focal) / disparityScale
-            let distance = abs(signedDifference)
+            var distance = abs(signedDifference)
+            if let subjectRange, let confidence = selectedSubjectConfidence?[i], confidence.isFinite {
+                // Uncertain/background alpha cannot expand the interval. A soft
+                // transition avoids a hard depth discontinuity at the matte edge.
+                let weight = min(1, max(0, (confidence-0.5)/0.4))
+                let subjectDistance = max(0, subjectRange.lowerBound-d, d-subjectRange.upperBound) / disparityScale
+                distance -= max(0, distance-subjectDistance) * weight
+            }
             let linear = min(1, max(0, (distance-clearBand) / transition))
             let amount = pow(linear, 0.85)
             if signedDifference > 0 {
@@ -171,7 +191,45 @@ enum DepthMath {
         return DepthPlan(width: depth.width, height: depth.height, near: near, far: far,
                          validFraction: fraction,
                          nearFraction: Double(nearCount)/Double(depth.values.count),
-                         farFraction: Double(farCount)/Double(depth.values.count), aperture: f)
+                         farFraction: Double(farCount)/Double(depth.values.count), aperture: f,
+                         subjectFocusRange: subjectRange)
+    }
+
+    private static func subjectFocusRange(in depth: DepthRaster, confidence: [Float],
+                                          point: NormalizedImagePoint, focal: Float,
+                                          disparityScale: Float, clearBand: Float,
+                                          face: NormalizedImagePoint?) -> ClosedRange<Float>? {
+        let x = min(depth.width-1, Int(point.x*Double(depth.width)))
+        let y = min(depth.height-1, Int(point.y*Double(depth.height)))
+        guard confidence[y*depth.width+x].isFinite, confidence[y*depth.width+x] >= 0.9 else { return nil }
+        let interior = depth.values.indices.compactMap { i -> Float? in
+            let d = depth.values[i], alpha = confidence[i]
+            return alpha.isFinite && alpha >= 0.9 && d.isFinite && d > 0 ? d : nil
+        }.sorted()
+        guard interior.count >= 9 else { return nil }
+        var low = quantile(interior, 0.1), high = quantile(interior, 0.9)
+        let limit = disparityScale * 0.6
+        // A real face can occupy less than 10% of a full-body instance. Its
+        // verified depth anchors the core before testing whether the tap belongs
+        // to it, so both sleeve and face taps work. This never admits a face from
+        // another instance, uncertain matte pixels, holes, or a distant plane.
+        if let face, face.isValid {
+            let fx = min(depth.width-1, Int(face.x*Double(depth.width)))
+            let fy = min(depth.height-1, Int(face.y*Double(depth.height)))
+            let alpha = confidence[fy*depth.width+fx]
+            if alpha.isFinite, alpha >= 0.9, depth.value(at: face) != nil,
+               let d = robustFocus(depth, at: face, disparityScale: disparityScale),
+               abs(d-focal) <= limit {
+                low = min(low, d); high = max(high, d)
+            }
+        }
+        // The central 80% rejects fringe depths and isolated outliers. A focus
+        // on an extended hand/object outside the body still selects that plane.
+        let tolerance = clearBand * disparityScale
+        guard focal >= low-tolerance, focal <= high+tolerance else { return nil }
+        // Bound adaptation by scene depth, even if an instance contains a long
+        // depth range. Never extend the interval to all depths in the matte.
+        return min(focal, max(low, focal-limit))...max(focal, min(high, focal+limit))
     }
 
     /// 小片区内的中位数。中心有有效深度时，优先同一深度簇，减少跨物体边界混采。

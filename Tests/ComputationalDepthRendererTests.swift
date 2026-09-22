@@ -80,6 +80,62 @@ struct ComputationalDepthRendererTests {
                    "EXIF \(exif): far tap preserves far pixels and blurs near pixels")
         }
 
+        // A selected instance spans several depths, with a farther arm and a
+        // separate person. The RGB texture makes an ignored mask or a blanket
+        // person cutout observable in the actual rendered pixels.
+        let subject = try subjectPlanes()
+        let sleeve = NormalizedImagePoint(x: 0.5, y: 0.55)
+        let head = NormalizedImagePoint(x: 0.5, y: 0.25)
+        let other = NormalizedImagePoint(x: 0.85, y: 0.3)
+        let arm = NormalizedImagePoint(x: 0.15, y: 0.5)
+        let wall = NormalizedImagePoint(x: 0.85, y: 0.8)
+        let selected = try renderer.render(original: original, depth: subject.depth, focus: sleeve,
+            aperture: 1.4, selectedSubject: subject.mask)
+        let selectedPixels = pixels(selected.image)
+        expect(difference(before, selectedPixels, at: head) < 1.5,
+               "Selecting a sleeve preserves the same person's supported head texture")
+        expect(texture(selectedPixels, at: other) < texture(before, at: other)*0.45,
+               "Subject adaptation does not sharpen another person at the head's depth")
+        expect(texture(selectedPixels, at: arm) < texture(before, at: arm)*0.7,
+               "A farther arm stays depth-blurred inside the selected instance")
+        expect(texture(selectedPixels, at: wall) < texture(before, at: wall)*0.45,
+               "Selected-person detail leaves strong f1.4 background blur")
+        let backgroundSelected = try renderer.render(original: original, depth: subject.depth, focus: wall,
+            aperture: 1.4, selectedSubject: subject.mask)
+        expect(texture(pixels(backgroundSelected.image), at: head) < texture(before, at: head)*0.45,
+               "A background tap blurs the person even when an old instance mask is supplied")
+        expect(difference(before, pixels(backgroundSelected.image), at: wall) < 1.5,
+               "A background tap preserves background texture")
+        for exif: UInt32 in 1...8 {
+            let upright = original.oriented(forExifOrientation: Int32(exif))
+            let uprightMask = subject.mask.oriented(forExifOrientation: Int32(exif))
+            let result = try renderer.render(original: upright, depth: subject.depth.oriented(exif: exif),
+                focus: sleeve.oriented(exif: exif), aperture: 1.4, selectedSubject: uprightMask)
+            let source = pixels(upright), actual = pixels(result.image)
+            expect(difference(source, actual, at: head.oriented(exif: exif)) < 1.5
+                   && texture(actual, at: other.oriented(exif: exif)) < texture(source, at: other.oriented(exif: exif))*0.45,
+                   "EXIF \(exif): selected instance confidence stays aligned with upright RGB and depth")
+        }
+
+        let smallFace = try smallFacePlanes()
+        let smallFaceRGB = try fixture(width: 1200, height: 1200)
+        let faceAnchor = NormalizedImagePoint(x: 0.5, y: 0.13)
+        let bodyTap = NormalizedImagePoint(x: 0.5, y: 0.55)
+        for exif: UInt32 in [1, 6, 8] {
+            let rgb = smallFaceRGB.oriented(forExifOrientation: Int32(exif))
+            let map = smallFace.depth.oriented(exif: exif)
+            let matte = smallFace.mask.oriented(forExifOrientation: Int32(exif))
+            let face = faceAnchor.oriented(exif: exif), body = bodyTap.oriented(exif: exif)
+            let result = try renderer.render(original: rgb, depth: map, focus: body, aperture: 1.4,
+                selectedSubject: matte, selectedSubjectFace: face)
+            expect(difference(pixels(rgb), pixels(result.image), at: face) < 1.5,
+                   "EXIF \(exif): a small verified face keeps actual detail when the body is selected")
+            let faceFocused = try renderer.render(original: rgb, depth: map, focus: face, aperture: 1.4,
+                selectedSubject: matte, selectedSubjectFace: face)
+            expect(difference(pixels(rgb), pixels(faceFocused.image), at: body) < 1.5,
+                   "EXIF \(exif): selecting the small face keeps the nearby body detail")
+        }
+
         let large = try fixture(width: 2304, height: 1536)
         let largeResult = try renderer.render(original: large, depth: depth, focus: near, aperture: 1.4)
         let largeBefore = pixels(large), largeAfter = pixels(largeResult.image)
@@ -117,6 +173,46 @@ struct ComputationalDepthRendererTests {
         }
         print("Computational depth renderer: \(checks) checks, \(failures) failures (synthetic pixels only)")
         if failures > 0 { exit(1) }
+    }
+
+    static func subjectPlanes() throws -> (depth: DepthRaster, mask: CIImage) {
+        var values = [Float](repeating: 0.03, count: 96*64)
+        var confidence = [UInt8](repeating: 0, count: 96*64)
+        for y in 8..<59 { for x in 25..<65 {
+            values[y*96+x] = y < 24 ? 0.34 : (y < 46 ? 0.54 : 0.58)
+            confidence[y*96+x] = 255
+        } }
+        for y in 25..<40 { for x in 8..<25 { values[y*96+x] = 0.18; confidence[y*96+x] = 255 } }
+        for y in 10..<32 { for x in 76..<93 { values[y*96+x] = 0.34 } }
+        for y in 48..<62 { for x in 3..<18 { values[y*96+x] = 0.9 } }
+        let depth = try DepthRaster(width: 96, height: 64, values: values)
+        guard let provider = CGDataProvider(data: Data(confidence) as CFData),
+              let cg = CGImage(width: 96, height: 64, bitsPerComponent: 8, bitsPerPixel: 8,
+                bytesPerRow: 96, space: CGColorSpaceCreateDeviceGray(),
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue), provider: provider,
+                decode: nil, shouldInterpolate: false, intent: .defaultIntent) else {
+            throw DepthRendererError.imageCreation
+        }
+        return (depth, CIImage(cgImage: cg, options: [.colorSpace: NSNull()]))
+    }
+
+    static func smallFacePlanes() throws -> (depth: DepthRaster, mask: CIImage) {
+        var values = [Float](repeating: 0.03, count: 10000)
+        var alpha = [UInt8](repeating: 0, count: 10000)
+        for y in 10..<90 { for x in 30..<70 {
+            values[y*100+x] = y < 16 ? 0.34 : 0.54
+            alpha[y*100+x] = 255
+        } }
+        for y in 70..<95 { for x in 0..<10 { values[y*100+x] = 0.9 } }
+        guard let provider = CGDataProvider(data: Data(alpha) as CFData),
+              let cg = CGImage(width: 100, height: 100, bitsPerComponent: 8, bitsPerPixel: 8,
+                bytesPerRow: 100, space: CGColorSpaceCreateDeviceGray(),
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue), provider: provider,
+                decode: nil, shouldInterpolate: false, intent: .defaultIntent) else {
+            throw DepthRendererError.imageCreation
+        }
+        return (try DepthRaster(width: 100, height: 100, values: values),
+                CIImage(cgImage: cg, options: [.colorSpace: NSNull()]))
     }
 
     static func twoPlanes() throws -> DepthRaster {

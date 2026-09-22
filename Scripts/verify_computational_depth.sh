@@ -11,6 +11,10 @@ trap 'rm -rf "$TASK_TMP"' EXIT
 cd "$ROOT"
 xcrun --sdk macosx swiftc -O -swift-version 5 -target "$(uname -m)-apple-macosx14.0" \
   TestCamer/DepthCapturePolicy.swift TestCamer/DepthMath.swift \
+  Tests/ComputationalSubjectFocusTests.swift -o "$TASK_TMP/subject-focus-tests"
+"$TASK_TMP/subject-focus-tests"
+xcrun --sdk macosx swiftc -O -swift-version 5 -target "$(uname -m)-apple-macosx14.0" \
+  TestCamer/DepthCapturePolicy.swift TestCamer/DepthMath.swift \
   TestCamer/DepthBlurRenderer.swift TestCamer/ComputationalDepthRenderer.swift \
   Tests/ComputationalDepthRendererTests.swift -o "$TASK_TMP/computational-depth-tests"
 "$TASK_TMP/computational-depth-tests"

@@ -1,4 +1,4 @@
-// 同帧人物保护：只决定哪些 RGB 像素保持清晰，不生成或替代相机深度。
+// 同帧人物选择：返回所选实例的置信遮罩，不生成或替代深度。
 import Foundation
 import CoreImage
 import CoreGraphics
@@ -7,19 +7,27 @@ import CoreVideo
 @preconcurrency import Vision
 
 struct PortraitSubjectSelection {
-    /// 白色保留原图，黑色允许真实深度控制的虚化；与正向原图具有相同 extent。
+    /// 白色表示可靠人物区域；与正向原图具有相同 extent，具体用途由渲染器决定。
     let mask: CIImage
     let focusPoint: NormalizedImagePoint
     let source: String
+    /// Optional face center verified inside the selected final mask, in upright coordinates.
+    let facePoint: NormalizedImagePoint?
+
+    init(mask: CIImage, focusPoint: NormalizedImagePoint, source: String,
+         facePoint: NormalizedImagePoint? = nil) {
+        self.mask = mask; self.focusPoint = focusPoint; self.source = source; self.facePoint = facePoint
+    }
 }
 
 struct PortraitSubjectMask {
     let context: CIContext
 
-    /// 点按落在人物内部时只保护该人物；没有点按时自动选择画面中面积最大的一个人。
-    /// 所有选择仅存在于这次渲染中。调用方必须先确认照片有可用的真实深度。
+    /// 点按落在人物内部时只选择该人物；没有点按时自动选择画面中面积最大的一个人。
+    /// 所有选择仅存在于这次渲染中。调用方须另行确认原生或估计深度有效。
     func select(in uprightImage: CIImage, nativeMatte: NativePortraitMatteSnapshot?,
-                exif: UInt32, tap: NormalizedImagePoint?, captureID: Int64? = nil) -> PortraitSubjectSelection? {
+                exif: UInt32, tap: NormalizedImagePoint?, captureID: Int64? = nil,
+                includeFaceAnchor: Bool = false) -> PortraitSubjectSelection? {
         let started = ProcessInfo.processInfo.systemUptime
         func log(_ event: String) {
             TestLog.shared.record(event, category: "portrait", captureID: captureID)
@@ -64,7 +72,9 @@ struct PortraitSubjectMask {
                     log("selection none reason=tap_outside_fine_instance_mask tapInside=false")
                     return nil
                 }
-                let point = tap ?? facePoint(in: analysisImage, selectedMask: selectedMask, captureID: captureID)
+                let face = tap == nil || includeFaceAnchor
+                    ? facePoint(in: analysisImage, selectedMask: selectedMask, captureID: captureID) : nil
+                let point = tap ?? face
                     ?? labels.interiorPoint(for: instance)
                 guard let point else {
                     log("selection none reason=no_interior_focus_candidate")
@@ -77,7 +87,8 @@ struct PortraitSubjectMask {
                         if value(in: native, at: point) >= 0.5 {
                             log("selection accepted source=native_single_person " + coverageSummary(native))
                             return PortraitSubjectSelection(mask: native, focusPoint: point,
-                                source: "同帧原生人物保护（单人）")
+                                source: "同帧原生人物保护（单人）",
+                                facePoint: includeFaceAnchor ? face.flatMap { value(in: native, at: $0) >= 0.9 ? $0 : nil } : nil)
                         }
                         log("native matte rejected reason=focus_candidate_outside_matte; trying_vision_segmentation")
                     }
@@ -114,7 +125,8 @@ struct PortraitSubjectMask {
                 }
                 log("selection accepted source=vision selectedBy=\(tap == nil ? "automatic" : "tap") " + coverageSummary(protection))
                 return PortraitSubjectSelection(mask: protection, focusPoint: point,
-                    source: tap == nil ? "自动人物实例保护" : "点选人物实例保护")
+                    source: tap == nil ? "自动人物实例保护" : "点选人物实例保护",
+                    facePoint: includeFaceAnchor ? face.flatMap { value(in: protection, at: $0) >= 0.9 ? $0 : nil } : nil)
             }
             // 实例模型确认无人或点中背景时不允许 aggregate 遮罩改变用户选择。
             log("selection none reason=\(tap == nil ? "no_person_instance" : "tap_outside_person_instances") " +
@@ -124,13 +136,15 @@ struct PortraitSubjectMask {
             log("instance request_or_mask failed \(TestLog.errorDescription(error)); trying_single_person_fallback")
             // 只有实例请求不可用才退回单人路径；多个人不能共用全人物遮罩。
             return singlePersonFallback(image: analysisImage, fullExtent: uprightImage.extent,
-                                        nativeMatte: nativeMatte, exif: exif, tap: tap, captureID: captureID)
+                                        nativeMatte: nativeMatte, exif: exif, tap: tap, captureID: captureID,
+                                        includeFaceAnchor: includeFaceAnchor)
         }
     }
 
     private func singlePersonFallback(image: CIImage, fullExtent: CGRect,
                                       nativeMatte: NativePortraitMatteSnapshot?, exif: UInt32,
-                                      tap: NormalizedImagePoint?, captureID: Int64?) -> PortraitSubjectSelection? {
+                                      tap: NormalizedImagePoint?, captureID: Int64?,
+                                      includeFaceAnchor: Bool) -> PortraitSubjectSelection? {
         func log(_ event: String) { TestLog.shared.record(event, category: "portrait", captureID: captureID) }
         let started = ProcessInfo.processInfo.systemUptime
         let people = VNDetectHumanRectanglesRequest()
@@ -163,13 +177,16 @@ struct PortraitSubjectMask {
                 log("selection none reason=tap_outside_fallback_mask tapInside=false")
                 return nil
             }
-            guard let point = tap ?? facePoint(in: image, selectedMask: mask, captureID: captureID)
+            let face = tap == nil || includeFaceAnchor
+                ? facePoint(in: image, selectedMask: mask, captureID: captureID) : nil
+            guard let point = tap ?? face
                     ?? interiorPoint(in: mask) else {
                 log("selection none reason=fallback_has_no_interior_focus_candidate")
                 return nil
             }
             log("selection accepted source=\(source) tapInside=\(tap == nil ? "not_applicable" : "true") " + coverageSummary(mask))
-            return PortraitSubjectSelection(mask: mask, focusPoint: point, source: source)
+            return PortraitSubjectSelection(mask: mask, focusPoint: point, source: source,
+                facePoint: includeFaceAnchor ? face.flatMap { value(in: mask, at: $0) >= 0.9 ? $0 : nil } : nil)
         } catch {
             log("selection none reason=single_person_fallback_failed \(TestLog.errorDescription(error))")
             return nil

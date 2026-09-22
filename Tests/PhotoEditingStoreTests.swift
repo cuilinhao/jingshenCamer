@@ -405,6 +405,38 @@ struct PhotoEditingStoreTests {
         expect(edited.depthData == nil && edited.recipe.aperture == 11, "legacy documents remain editable without creating depth")
     }
 
+    static func renderingInfoSurvivesRestartAndEdit() async throws {
+        let root = try temporaryDirectory(); defer { try? fm.removeItem(at: root) }
+        let store = EditablePhotoStore(rootDirectory: root)
+        for (depth, info) in [(try depthBytes(), ["appleFallbackReason": "native depth unavailable", "usedAppleMetadataCompatibility": false] as [String: Any]),
+                              (nil, ["usedAppleMetadataCompatibility": true])] as [(Data?, [String: Any])] {
+            let photo = withDepth(document(), depth)
+            try await store.save(photo)
+            let package = root.appendingPathComponent(photo.id.uuidString)
+            let manifest = try manifestURL(in: package)
+            var metadata = try JSONSerialization.jsonObject(with: Data(contentsOf: manifest)) as! [String: Any]
+            metadata["renderingInfo"] = info
+            try JSONSerialization.data(withJSONObject: metadata).write(to: manifest)
+            var reopened = try await EditablePhotoStore(rootDirectory: root).load(id: photo.id)
+            reopened.recipe = .init(aperture: 8, sensorFocus: photo.recipe.sensorFocus)
+            reopened.previewData = Data([1, 5, 9])
+            try await store.save(reopened)
+            let saved = try JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL(in: package))) as! [String: Any]
+            expect((saved["renderingInfo"] as? NSDictionary) == NSDictionary(dictionary: info),
+                   "Restart and edit preserve the preview's fallback or Apple compatibility provenance")
+            reopened.renderingInfo?.usedAppleMetadataCompatibility.toggle()
+            reopened.previewData = Data([2, 6, 10])
+            try await store.save(reopened)
+            let updated = try await EditablePhotoStore(rootDirectory: root).load(id: photo.id)
+            expect(updated.renderingInfo == reopened.renderingInfo && updated.previewData == reopened.previewData,
+                   "Updated compatibility provenance commits atomically with its corresponding preview")
+        }
+        let legacy = document()
+        try await store.save(legacy)
+        let loadedLegacy = try await store.load(id: legacy.id)
+        expect(loadedLegacy.renderingInfo == nil, "Old photos without provenance remain readable without inventing a fallback")
+    }
+
     static func main() async {
         do {
             try await roundTripAndUpdate()
@@ -419,6 +451,7 @@ struct PhotoEditingStoreTests {
             try await depthAttachmentPersistenceAndImmutability()
             try await damagedDepthAttachmentsAreReported()
             try await legacySchemaRemainsReadable()
+            try await renderingInfoSurvivesRestartAndEdit()
         } catch { failures += 1; print("FAIL: unexpected error: \(error)") }
         print("Photo editing store: \(checks) checks, \(failures) failures")
         if failures != 0 { exit(1) }

@@ -26,6 +26,7 @@ final class PhotoEditorViewController: UIViewController {
     private let focusBox = UIView()
     private let slider = UISlider()
     private let apertureLabel = UILabel()
+    private let rendererLabel = UILabel()
     private let stateLabel = UILabel()
     private let compareButton = UIButton(type: .system)
     private let resetButton = UIButton(type: .system)
@@ -109,6 +110,12 @@ final class PhotoEditorViewController: UIViewController {
         apertureLabel.font = .monospacedDigitSystemFont(ofSize: 18, weight: .semibold)
         apertureLabel.textColor = .systemYellow
         apertureLabel.setContentHuggingPriority(.required, for: .horizontal)
+        rendererLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        rendererLabel.textColor = .lightGray
+        rendererLabel.textAlignment = .center
+        rendererLabel.numberOfLines = 0
+        rendererLabel.accessibilityIdentifier = "editRenderer"
+        updateRendererLabel()
         stateLabel.font = .systemFont(ofSize: 13)
         stateLabel.textColor = .lightGray
         stateLabel.textAlignment = .center
@@ -130,7 +137,7 @@ final class PhotoEditorViewController: UIViewController {
         actionRow.axis = .horizontal
         actionRow.spacing = 10
         actionRow.distribution = .fillEqually
-        let panel = UIStackView(arrangedSubviews: [apertureRow, stateLabel, retrySaveButton, actionRow, exportButton])
+        let panel = UIStackView(arrangedSubviews: [apertureRow, rendererLabel, stateLabel, retrySaveButton, actionRow, exportButton])
         panel.axis = .vertical
         panel.spacing = 12
         for item in [imageView, panel, spinner] {
@@ -200,6 +207,10 @@ final class PhotoEditorViewController: UIViewController {
                         recipe: request.recipe, maximumDimension: 1600, depthData: document.depthData)
                     guard let image = UIImage(data: result.jpegData) else { throw CameraError.captureFailed }
                     if session.complete(request, succeeded: true) {
+                        document.renderingInfo = PhotoRenderingInfo(
+                            appleFallbackReason: document.renderingInfo?.appleFallbackReason,
+                            usedAppleMetadataCompatibility: result.usedMetadataCompatibility)
+                        updateRendererLabel()
                         renderedImage = image
                         imageView.image = image
                         document.recipe = request.recipe
@@ -245,6 +256,18 @@ final class PhotoEditorViewController: UIViewController {
         apertureLabel.text = String(format: "f/%.1f", value)
         slider.accessibilityValue = apertureLabel.text
         positionFocusBox()
+    }
+
+    private func updateRendererLabel() {
+        // 附件决定实际编辑路线；重开照片也沿用同一规则，不能沿用主摄按钮的意图。
+        if document.depthData != nil {
+            rendererLabel.text = document.renderingInfo?.appleFallbackReason != nil
+                ? "智能景深 · 本次苹果景深不可用，已自动回退"
+                : "智能景深 · 本机计算"
+        } else {
+            rendererLabel.text = document.renderingInfo?.usedAppleMetadataCompatibility == true
+                ? "苹果景深（兼容）" : "苹果景深"
+        }
     }
 
     private func positionFocusBox() {

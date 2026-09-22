@@ -51,6 +51,7 @@ actor EditablePhotoStore {
         let sourceSHA256: String
         let previewSHA256: String
         let depthSHA256: String?
+        let renderingInfo: PhotoRenderingInfo?
     }
 
     private let rootDirectory: URL
@@ -119,7 +120,8 @@ actor EditablePhotoStore {
             } else { depth = nil }
             let document = EditablePhotoDocument(id: id, createdAt: manifest.createdAt, updatedAt: manifest.updatedAt,
                                                  sourceData: source, initialRecipe: manifest.initialRecipe,
-                                                 recipe: manifest.recipe, previewData: preview, depthData: depth)
+                                                 recipe: manifest.recipe, previewData: preview, depthData: depth,
+                                                 renderingInfo: manifest.renderingInfo)
             guard Self.isValid(document) else { throw EditablePhotoStoreError.invalidDocument }
             return document
         } catch { throw EditablePhotoStoreError.damaged(error.localizedDescription) }
@@ -232,7 +234,8 @@ actor EditablePhotoStore {
                                     updatedAt: document.updatedAt, initialRecipe: document.initialRecipe,
                                     recipe: document.recipe, sourceSHA256: Self.digest(document.sourceData),
                                     previewSHA256: Self.digest(document.previewData),
-                                    depthSHA256: document.depthData.map(Self.digest))
+                                    depthSHA256: document.depthData.map(Self.digest),
+                                    renderingInfo: document.renderingInfo)
             try JSONEncoder().encode(manifest).write(to: revision.appendingPathComponent("manifest.json"), options: .atomic)
             let pointer = Pointer(schemaVersion: schemaVersion, id: document.id, revision: revisionID)
             try JSONEncoder().encode(pointer).write(to: package.appendingPathComponent("current.json"), options: .atomic)

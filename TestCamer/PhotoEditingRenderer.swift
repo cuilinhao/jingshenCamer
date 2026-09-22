@@ -73,8 +73,11 @@ final class PhotoEditingRenderer: @unchecked Sendable {
         guard depth.value(at: focus) != nil else { throw PhotoEditingRenderingError.focusUnavailable }
         let image: CIImage
         do {
+            let subject = PortraitSubjectMask(context: context).select(in: original,
+                nativeMatte: nil, exif: 1, tap: focus, includeFaceAnchor: true)
             image = try ComputationalDepthRenderer(context: context, colorSpace: colorSpace)
-                .render(original: original, depth: depth, focus: focus, aperture: recipe.aperture).image
+                .render(original: original, depth: depth, focus: focus, aperture: recipe.aperture,
+                        selectedSubject: subject?.mask, selectedSubjectFace: subject?.facePoint).image
         } catch DepthAnalysisError.insufficientSeparation {
             image = original
         }

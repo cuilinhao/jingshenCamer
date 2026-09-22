@@ -333,7 +333,9 @@ private extension ViewController {
                 showCapturedImage(image)
                 if let recipe = result.editRecipe {
                     let document = EditablePhotoDocument(sourceData: payload.data, initialRecipe: recipe,
-                        recipe: recipe, previewData: result.previewData, depthData: result.editDepthData)
+                        recipe: recipe, previewData: result.previewData, depthData: result.editDepthData,
+                        renderingInfo: PhotoRenderingInfo(appleFallbackReason: result.appleFallbackReason,
+                            usedAppleMetadataCompatibility: result.usedAppleMetadataCompatibility))
                     var saveError: String?
                     do { try await editableStore.save(document) }
                     catch { saveError = error.localizedDescription }
@@ -461,7 +463,8 @@ private extension ViewController {
     @objc func beginComparison() {
         guard !isSaving, processedPhoto?.outcome.canCompare == true else { return }
         capturedImageView.image = originalComparisonImage
-        resultInfoLabel.text = "原图 · 松开恢复苹果景深\n同一次快门 · 未添加景深虚化"
+        let rendererTitle = processedPhoto?.rendererTitle ?? "当前效果"
+        resultInfoLabel.text = "原图 · 松开恢复\(rendererTitle)\n同一次快门 · 未添加景深虚化"
         legacyCompareButton.isEnabled = false
     }
 

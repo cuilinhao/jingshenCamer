@@ -62,6 +62,11 @@ final class CaptureComparisonViewController: UIViewController {
         }
         imageView.image = UIImage(data: data)
         note.text = String(format: "%@ · 拍摄光圈 f/%.1f\n此处只查看初始对照，不改变当前编辑或导出。", result, photo.aperture)
+        if photo.appleFallbackReason != nil {
+            note.text? += photo.outcome.canCompare
+                ? "\n本次苹果景深不可用，已自动回退智能景深。"
+                : "\n本次景深处理未成功，已保留原图。"
+        }
     }
 
     @objc private func close() { dismiss(animated: true) }

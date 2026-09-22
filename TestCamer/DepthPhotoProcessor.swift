@@ -28,6 +28,8 @@ struct ProcessedPhoto: Sendable {
     var editRecipe: PhotoEditRecipe? = nil
     /// 传感器坐标的不可变视差附件；与原始容器一起保存在本机。
     var editDepthData: Data? = nil
+    /// 本次确实从苹果路径回退；供 UI 展示结果，不根据所选镜头猜测。
+    var appleFallbackReason: String? = nil
 
     var rendererTitle: String {
         usedAppleMetadataCompatibility ? "苹果景深（兼容）" : renderer.title
@@ -76,6 +78,7 @@ final class DepthPhotoProcessor: @unchecked Sendable {
                             appleFallbackReason = "native depth unavailable"
                         }
                         if let reason = appleFallbackReason {
+                            primary.appleFallbackReason = reason
                             let note = "preferredRenderer=apple\nappleFallbackReason=\(reason)\nactualRenderer=\(primary.renderer.rawValue)"
                             primary.diagnosticText += "\n" + note
                             TestLog.shared.record(note, category: "processor", captureID: photo.captureID)
@@ -390,8 +393,12 @@ final class DepthPhotoProcessor: @unchecked Sendable {
                     sensorFocus: photo.transientDeviceFocus ?? focus.oriented(exif: inverse))
                 let rendered: DepthBlurOutput
                 do {
+                    // 首次处理与缓存编辑采用同一人物选择规则；只扩大当前点中实例的清晰带。
+                    let subject = PortraitSubjectMask(context: context).select(in: original,
+                        nativeMatte: nil, exif: 1, tap: focus, captureID: photo.captureID, includeFaceAnchor: true)
                     rendered = try ComputationalDepthRenderer(context: context, colorSpace: colorSpace)
-                        .render(original: original, depth: depth, focus: focus, aperture: initial.aperture)
+                        .render(original: original, depth: depth, focus: focus, aperture: initial.aperture,
+                                selectedSubject: subject?.mask, selectedSubjectFace: subject?.facePoint)
                 } catch DepthAnalysisError.insufficientSeparation {
                     // A flat scene remains editable; inventing separation would
                     // turn a depth effect into an arbitrary full-frame blur.

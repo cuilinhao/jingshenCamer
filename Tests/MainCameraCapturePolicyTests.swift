@@ -66,6 +66,101 @@ struct MainCameraCapturePolicyTests {
               "无法核实来源的主摄照片不得作为已保证主摄交付")
         check(!MainCameraCapturePolicy.acceptsMainPhoto(sourceType: "dual-wide", expectedSourceTypes: sources, fusionEnabled: true),
               "主摄锁定也不能允许成片混入其他 RGB 镜头的融合图像")
+
+        let exactPrimary = MainCameraPrimaryIdentity(id: "wide-A", rgbKind: .wide, isVirtual: false)
+        let otherPrimary = MainCameraPrimaryIdentity(id: "wide-B", rgbKind: .wide, isVirtual: false)
+        let depthPrimary = MainCameraPrimaryIdentity(id: "depth", rgbKind: nil, isVirtual: false)
+        let dual = candidate("dual", .dual, locked: true)
+        func rejection(_ input: MainCameraAuxiliaryCandidate?, configuredID: String = "lidar",
+                       kind: MainCameraAuxiliaryKind = .lidar,
+                       phase: MainCameraIdentityPhase = .capture,
+                       primary: MainCameraPrimaryIdentity? = nil,
+                       requestedLocked: Bool = false, activeLocked: Bool = false) -> MainCameraIdentityRejection? {
+            MainCameraCapturePolicy.identityRejection(for: wide, configuredInputID: configuredID,
+                configuredKind: kind, currentInput: input, phase: phase, primary: primary,
+                requestedPrimaryLocked: requestedLocked, activePrimaryLocked: activeLocked)
+        }
+        for phase in [MainCameraIdentityPhase.configuration, .capture] {
+            check(rejection(lidar, phase: phase) == nil,
+                  "LiDAR 唯一物理 RGB 精确配对时配置和首次快门均不依赖尚未给出的 primary")
+            check(rejection(lidar, phase: phase, primary: depthPrimary) == nil,
+                  "LiDAR 的非 RGB primary 不推翻已核实的唯一物理 RGB 配对")
+            check(rejection(lidar, phase: phase, primary: exactPrimary) == nil,
+                  "LiDAR 明确报告所选物理主摄时允许使用")
+            check(rejection(lidar, phase: phase, primary: otherPrimary) == .activePrimaryMismatch,
+                  "LiDAR 明确指向其他物理 RGB 是矛盾证据，配置和快门均须拒绝")
+        }
+        check(rejection(lidar, configuredID: "previous-lidar") == .inputIDMismatch,
+              "当前 LiDAR 输入必须是本次成功配置的同一个设备")
+        check(rejection(dual, configuredID: "dual") == .inputKindMismatch,
+              "不能将双摄输入误当作已经配置的 LiDAR")
+        check(rejection(nil) == .currentInputNotAuxiliary,
+              "实际输入已变成独立 RGB 时不可沿用 LiDAR 身份状态")
+        check(rejection(candidate("lidar", .lidar, constituents: rgb)) == .lidarRGBCountInvalid,
+              "LiDAR 实际有多颗 RGB 时不能根据其中一颗匹配而放行")
+        check(rejection(candidate("lidar", .lidar, constituents: [])) == .selectedPhysicalWideMissing,
+              "LiDAR 缺少可验证的物理 RGB 时须拒绝")
+        check(rejection(candidate("lidar", .lidar, constituents: [
+            .init(id: "wide-B", kind: .wide, isVirtual: false)])) == .selectedPhysicalWideMissing,
+              "LiDAR 唯一 RGB 也必须匹配选定主摄 ID")
+        check(rejection(candidate("lidar", .lidar, constituents: [
+            .init(id: "wide-A", kind: .wide, isVirtual: true)])) == .selectedPhysicalWideMissing,
+              "LiDAR 相同 ID 的虚拟 RGB 不构成物理主摄证明")
+        check(rejection(lidar, primary: .init(id: "wide-A", rgbKind: .telephoto, isVirtual: false)) == .activePrimaryMismatch,
+              "primary 即使 ID 相同，明确为不同 RGB 类型也必须拒绝")
+        check(rejection(dual, configuredID: "dual", kind: .dual, phase: .configuration,
+                        requestedLocked: true) == nil,
+              "双摄配置事务尚未运行时不要求 activePrimary 已生效")
+        check(rejection(dual, configuredID: "dual", kind: .dual, phase: .configuration) == .requestedPrimaryNotLocked,
+              "双摄配置阶段必须已成功请求精确锁定")
+        for kind in [MainCameraAuxiliaryKind.dualWide, .dual, .triple] {
+            let input = candidate("stereo", kind, locked: true)
+            check(rejection(input, configuredID: "stereo", kind: kind, primary: exactPrimary,
+                            requestedLocked: true, activeLocked: true) == nil,
+                  "可切 RGB 组合在快门时须精确 primary 与请求/活动锁定全部成立")
+            check(rejection(input, configuredID: "stereo", kind: kind,
+                            requestedLocked: true, activeLocked: true) == .activePrimaryMissing,
+                  "双/三摄首次快门和恢复后不能凭配置锁定放过缺失 primary")
+            check(rejection(input, configuredID: "stereo", kind: kind, primary: exactPrimary,
+                            requestedLocked: true) == .activePrimaryNotLocked,
+                  "双/三摄只请求锁定但活动锁定丢失时必须恢复")
+            check(rejection(input, configuredID: "stereo", kind: kind, primary: exactPrimary,
+                            activeLocked: true) == .requestedPrimaryNotLocked,
+                  "双/三摄当前正确但未锁定仍可能切镜头，不能放行")
+            check(rejection(input, configuredID: "stereo", kind: kind, primary: depthPrimary,
+                            requestedLocked: true, activeLocked: true) == .activePrimaryNotPhysicalRGB,
+                  "双/三摄必须明确报告物理 RGB primary")
+            check(rejection(input, configuredID: "stereo", kind: kind, primary: otherPrimary,
+                            requestedLocked: true, activeLocked: true) == .activePrimaryMismatch,
+                  "双/三摄活动 primary 的物理 ID 不同必须拒绝")
+        }
+        check(rejection(dual, configuredID: "dual", kind: .dual,
+                        primary: .init(id: "wide-A", rgbKind: .wide, isVirtual: true),
+                        requestedLocked: true, activeLocked: true) == .activePrimaryNotPhysicalRGB,
+              "双摄的虚拟 primary 不能冒充所选物理主摄")
+        for attempted in [false, true] {
+            check(MainCameraCapturePolicy.captureRecovery(for: nil, auxiliaryKind: .lidar,
+                supportsExactPrimaryLock: false, relockAttempted: attempted) == .useCurrentInput,
+                  "有效 LiDAR 首次或恢复后直接拍照，不每次快门重配")
+            check(MainCameraCapturePolicy.captureRecovery(for: .activePrimaryMismatch, auxiliaryKind: .lidar,
+                supportsExactPrimaryLock: true, relockAttempted: attempted) == .restorePhysicalMain,
+                  "矛盾 LiDAR 不尝试切换 RGB，通过独立主摄保障身份并保留智能回退")
+        }
+        check(MainCameraCapturePolicy.captureRecovery(for: .activePrimaryMissing, auxiliaryKind: .dual,
+            supportsExactPrimaryLock: true, relockAttempted: false) == .relockExactPrimary,
+              "双摄活动身份未生效或恢复后丢失时只重新精确锁定一次")
+        check(MainCameraCapturePolicy.captureRecovery(for: nil, auxiliaryKind: .dual,
+            supportsExactPrimaryLock: true, relockAttempted: true) == .useCurrentInput,
+              "重新锁定通过验证后直接拍照，保留原生深度输入")
+        check(MainCameraCapturePolicy.captureRecovery(for: .activePrimaryMissing, auxiliaryKind: .dual,
+            supportsExactPrimaryLock: true, relockAttempted: true) == .restorePhysicalMain,
+              "重新锁定仍失败后降级，不循环重试")
+        check(MainCameraCapturePolicy.captureRecovery(for: .activePrimaryMissing, auxiliaryKind: .dual,
+            supportsExactPrimaryLock: false, relockAttempted: false) == .restorePhysicalMain,
+              "无法精确锁定时直接回独立主摄")
+        check(MainCameraCapturePolicy.captureRecovery(for: .inputIDMismatch, auxiliaryKind: .dual,
+            supportsExactPrimaryLock: true, relockAttempted: false) == .restorePhysicalMain,
+              "结构性输入身份错误不能尝试在错误设备上锁定")
         print("Main camera capture policy: \(checks) checks, \(failures) failures")
         if failures != 0 { exit(1) }
     }

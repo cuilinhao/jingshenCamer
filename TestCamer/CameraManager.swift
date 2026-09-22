@@ -46,6 +46,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
     private var selectedRearDeviceID: String?
     private var rearDigitalZoom: Double = 1
     private var mainAuxiliaryKind: MainCameraAuxiliaryKind?
+    private var mainAuxiliaryInputID: String?
     private var nativeRawZoom: Double = 1
 
     private final class PendingCapture {
@@ -472,19 +473,18 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
                 (.builtInTripleCamera, .triple), (.builtInLiDARDepthCamera, .lidar)
             ]
             let discovered = types.compactMap { type, kind -> (AVCaptureDevice, MainCameraAuxiliaryCandidate)? in
-                guard let device = AVCaptureDevice.default(type, for: .video, position: .back) else { return nil }
-                let exactLockSupported: Bool
-                if #available(iOS 27.0, *) {
-                    exactLockSupported = device.isPrimaryConstituentDeviceSwitchingBehaviorLockedWithDeviceSupported
-                } else { exactLockSupported = false }
-                let constituents = device.constituentDevices.compactMap { constituent -> CameraLensCandidate? in
-                    guard let lensKind = physicalLensKind(for: constituent.deviceType) else { return nil }
-                    return CameraLensCandidate(id: constituent.uniqueID, kind: lensKind,
-                                               isVirtual: constituent.isVirtualDevice)
+                guard let device = AVCaptureDevice.default(type, for: .video, position: .back),
+                      let candidate = auxiliaryCandidate(for: device) else {
+                    TestLog.shared.record("auxiliary unavailable type=\(type.rawValue), kind=\(kind)", category: "camera")
+                    return nil
                 }
-                return (device, MainCameraAuxiliaryCandidate(id: device.uniqueID, kind: kind,
-                    isVirtual: device.isVirtualDevice, rgbConstituents: constituents,
-                    supportsExactPrimaryLock: exactLockSupported))
+                let rejection = MainCameraCapturePolicy.auxiliaryRejection(for: choice, candidate: candidate)
+                TestLog.shared.record("auxiliary candidate type=\(type.rawValue), id=\(device.uniqueID), " +
+                    "selectedID=\(choice.id), virtual=\(candidate.isVirtual), " +
+                    "exactLockSupported=\(candidate.supportsExactPrimaryLock), " +
+                    "rgb=\(rgbIdentityDescription(candidate.rgbConstituents)), " +
+                    "rejection=\(rejection?.rawValue ?? "none")", category: "camera")
+                return (device, candidate)
             }
             for candidate in MainCameraCapturePolicy.auxiliaries(for: choice, candidates: discovered.map { $0.1 }) {
                 if let device = discovered.first(where: { $0.0.uniqueID == candidate.id })?.0 {
@@ -499,6 +499,8 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
         disableDepthDelivery()
         if let deviceInput { session.removeInput(deviceInput) }
         deviceInput = nil
+        mainAuxiliaryKind = nil
+        mainAuxiliaryInputID = nil
         session.sessionPreset = .photo
         if !session.outputs.contains(photoOutput) {
             guard session.canAddOutput(photoOutput) else { throw CameraError.configurationFailed }
@@ -507,36 +509,49 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
         photoOutput.maxPhotoQualityPrioritization = .quality
         for candidate in inputs {
             let device = candidate.device
+            var configurationStep = "createInput"
             do {
                 let input = try AVCaptureDeviceInput(device: device)
+                configurationStep = "sessionCannotAddInput"
                 guard session.canAddInput(input) else { throw CameraError.configurationFailed }
                 session.addInput(input)
                 deviceInput = input
                 mainAuxiliaryKind = candidate.auxiliary
+                mainAuxiliaryInputID = candidate.auxiliary == nil ? nil : device.uniqueID
                 nativeRawZoom = 1
                 if let auxiliary = candidate.auxiliary, let choice {
+                    configurationStep = "selectedPhysicalWideMissing"
                     guard let constituent = device.constituentDevices.first(where: {
                         $0.uniqueID == choice.id && $0.deviceType == .builtInWideAngleCamera && !$0.isVirtualDevice
                     }) else { throw CameraError.configurationFailed }
                     if auxiliary != .lidar {
+                        configurationStep = "exactPrimaryLockUnsupported"
                         guard #available(iOS 27.0, *),
-                              device.isPrimaryConstituentDeviceSwitchingBehaviorLockedWithDeviceSupported,
-                              let baseZoom = MainCameraCapturePolicy.nativeRawZoom(selectedID: choice.id,
+                              device.isPrimaryConstituentDeviceSwitchingBehaviorLockedWithDeviceSupported else {
+                            throw CameraError.configurationFailed
+                        }
+                        configurationStep = "nativeRawZoomUnavailable"
+                        guard let baseZoom = MainCameraCapturePolicy.nativeRawZoom(selectedID: choice.id,
                                   constituentIDs: device.constituentDevices.map(\.uniqueID),
                                   switchOverFactors: device.virtualDeviceSwitchOverVideoZoomFactors.map(\.doubleValue)) else {
                             throw CameraError.configurationFailed
                         }
                         nativeRawZoom = baseZoom
+                        configurationStep = "lockExactPrimary"
                         try device.lockForConfiguration()
                         device.setPrimaryConstituentDeviceSwitchingBehaviorLockedWith(constituent)
                         device.unlockForConfiguration()
-                        guard device.primaryConstituentDeviceSwitchingBehavior == .locked else {
-                            throw CameraError.configurationFailed
-                        }
+                    }
+                    if let rejection = auxiliaryIdentityRejection(for: choice, configuredInputID: device.uniqueID,
+                        configuredKind: auxiliary, phase: .configuration) {
+                        configurationStep = rejection.rawValue
+                        throw CameraError.configurationFailed
                     }
                     // 仅在主摄原生视场有实际照片深度时采用辅助输入；失败继续探测 LiDAR / 独立主摄。
-                    guard photoOutput.isDepthDataDeliverySupported,
-                          zoomPlan(nativeRawZoom, for: device).depthEnabled else {
+                    configurationStep = "photoDepthDeliveryUnsupported"
+                    guard photoOutput.isDepthDataDeliverySupported else { throw CameraError.configurationFailed }
+                    configurationStep = "nativeFieldOfViewDepthUnavailable"
+                    guard zoomPlan(nativeRawZoom, for: device).depthEnabled else {
                         throw CameraError.configurationFailed
                     }
                 }
@@ -547,7 +562,9 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
                     Int64($0.width) * Int64($0.height) <= DepthCapturePolicy.preferredPhotoPixelCount
                 }) ?? dimensions.first
                 if let preferred { photoOutput.maxPhotoDimensions = preferred }
+                configurationStep = "applyRequestedZoom"
                 try applyZoom(requestedDigitalZoom, to: device)
+                configurationStep = "configureFocusExposureWhiteBalance"
                 try device.lockForConfiguration()
                 if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
                 if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
@@ -558,18 +575,20 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
                 if let choice { selectedRearDeviceID = choice.id }
                 isConfigured = true
                 TestLog.shared.record("[Camera] configured logicalLens=\(choice?.title ?? "front"), " +
-                    "inputType=\(device.deviceType.rawValue), physicalInput=\(!device.isVirtualDevice), " +
+                    "inputType=\(device.deviceType.rawValue), inputID=\(device.uniqueID), physicalInput=\(!device.isVirtualDevice), " +
                     "depth=\(currentDepthSupported), digitalZoom=\(Double(device.videoZoomFactor) / nativeRawZoom), " +
                     "rawZoom=\(device.videoZoomFactor), nativeRawZoom=\(nativeRawZoom), " +
                     "photo=\(photoOutput.maxPhotoDimensions.width)x\(photoOutput.maxPhotoDimensions.height)", category: "camera")
                 return
             } catch {
                 TestLog.shared.record("input rejected type=\(device.deviceType.rawValue), " +
-                    "auxiliary=\(String(describing: candidate.auxiliary)), reason=\(error.localizedDescription)", category: "camera")
+                    "auxiliary=\(String(describing: candidate.auxiliary)), condition=\(configurationStep), " +
+                    "reason=\(TestLog.errorDescription(error))", category: "camera")
                 disableDepthDelivery()
                 if let deviceInput { session.removeInput(deviceInput) }
                 deviceInput = nil
                 mainAuxiliaryKind = nil
+                mainAuxiliaryInputID = nil
                 nativeRawZoom = 1
                 if candidate.auxiliary == nil { throw error }
             }
@@ -587,25 +606,24 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
         guard let selected = selectedRearLens, let device = deviceInput?.device else {
             throw CameraError.unavailable
         }
-        if mainAuxiliaryKind == nil {
+        guard let auxiliary = mainAuxiliaryKind else {
             guard !device.isVirtualDevice, device.uniqueID == selected.id else { throw CameraError.unavailable }
             return
         }
-        func primaryIsVerified() -> Bool {
-            let primary = device.activePrimaryConstituent
-            let exactPrimary = primary?.uniqueID == selected.id && primary?.deviceType == .builtInWideAngleCamera
-            let stablePrimary = mainAuxiliaryKind == .lidar ||
-                (device.primaryConstituentDeviceSwitchingBehavior == .locked &&
-                 device.activePrimaryConstituentDeviceSwitchingBehavior == .locked)
-            return selected.kind == .wide && exactPrimary && stablePrimary
-        }
-        if primaryIsVerified() { return }
+        let configuredInputID = mainAuxiliaryInputID ?? ""
+        var rejection = auxiliaryIdentityRejection(for: selected, configuredInputID: configuredInputID,
+            configuredKind: auxiliary, phase: .capture)
+        let supportsExactLock = auxiliaryCandidate(for: device)?.supportsExactPrimaryLock ?? false
+        let recovery = MainCameraCapturePolicy.captureRecovery(for: rejection, auxiliaryKind: auxiliary,
+            supportsExactPrimaryLock: supportsExactLock, relockAttempted: false)
+        if recovery == .useCurrentInput { return }
         // 会话重置后允许用显式 ID 重新锁定一次；从不等待场景/变焦触发自动切换。
-        if #available(iOS 27.0, *), mainAuxiliaryKind != .lidar,
-           device.isPrimaryConstituentDeviceSwitchingBehaviorLockedWithDeviceSupported,
+        if #available(iOS 27.0, *), recovery == .relockExactPrimary,
            let constituent = device.constituentDevices.first(where: {
                $0.uniqueID == selected.id && $0.deviceType == .builtInWideAngleCamera && !$0.isVirtualDevice
            }) {
+            TestLog.shared.record("main RGB recovery action=relockExactPrimary, reason=\(rejection?.rawValue ?? "none"), " +
+                "inputID=\(device.uniqueID), selectedID=\(selected.id)", category: "camera")
             var relockSucceeded = false
             do {
                 session.beginConfiguration()
@@ -619,9 +637,19 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
             } catch {
                 TestLog.shared.record("main RGB relock failed: \(error.localizedDescription)", category: "camera")
             }
-            if relockSucceeded && primaryIsVerified() { return }
+            rejection = auxiliaryIdentityRejection(for: selected, configuredInputID: configuredInputID,
+                configuredKind: auxiliary, phase: .capture)
+            let afterRelock = MainCameraCapturePolicy.captureRecovery(for: rejection, auxiliaryKind: auxiliary,
+                supportsExactPrimaryLock: supportsExactLock, relockAttempted: true)
+            if relockSucceeded && afterRelock == .useCurrentInput {
+                TestLog.shared.record("main RGB recovery completed action=relockExactPrimary, " +
+                    "depth=\(currentDepthSupported)", category: "camera")
+                return
+            }
         }
-        TestLog.shared.record("main RGB identity unverified; restoring selected independent wide before capture", category: "camera")
+        TestLog.shared.record("main RGB recovery action=restorePhysicalMain, " +
+            "reason=\(rejection?.rawValue ?? "relockConfigurationFailed"), " +
+            "inputID=\(device.uniqueID), selectedID=\(selected.id)", category: "camera")
         let restart = wantsToRun
         let digitalZoom = rearDigitalZoom
         if session.isRunning { session.stopRunning() }
@@ -634,6 +662,9 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
                 try configureSession(for: .back, rearLensID: selected.id, digitalZoom: digitalZoom)
                 if restart { session.startRunning() }
                 eventHandler?(.ready(makeState()))
+                TestLog.shared.record("main RGB recovery restored preview after physical fallback failed; " +
+                    "current capture rejected, inputID=\(deviceInput?.device.uniqueID ?? "nil"), " +
+                    "depth=\(currentDepthSupported)", category: "camera")
             } catch {
                 TestLog.shared.record("main RGB recovery failed: \(error.localizedDescription)", category: "camera")
                 eventHandler?(.issue(error.localizedDescription))
@@ -645,6 +676,62 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
         guard deviceInput?.device.uniqueID == selected.id, deviceInput?.device.isVirtualDevice == false else {
             throw CameraError.unavailable
         }
+        TestLog.shared.record("main RGB recovery completed action=restorePhysicalMain, " +
+            "inputID=\(selected.id), depth=\(currentDepthSupported)", category: "camera")
+    }
+
+    private func auxiliaryCandidate(for device: AVCaptureDevice) -> MainCameraAuxiliaryCandidate? {
+        let kind: MainCameraAuxiliaryKind
+        switch device.deviceType {
+        case .builtInDualWideCamera: kind = .dualWide
+        case .builtInDualCamera: kind = .dual
+        case .builtInTripleCamera: kind = .triple
+        case .builtInLiDARDepthCamera: kind = .lidar
+        default: return nil
+        }
+        let supportsExactLock: Bool
+        if #available(iOS 27.0, *) {
+            supportsExactLock = device.isPrimaryConstituentDeviceSwitchingBehaviorLockedWithDeviceSupported
+        } else { supportsExactLock = false }
+        let rgb = device.constituentDevices.compactMap { constituent -> CameraLensCandidate? in
+            guard let lensKind = physicalLensKind(for: constituent.deviceType) else { return nil }
+            return CameraLensCandidate(id: constituent.uniqueID, kind: lensKind, isVirtual: constituent.isVirtualDevice)
+        }
+        return MainCameraAuxiliaryCandidate(id: device.uniqueID, kind: kind,
+            isVirtual: device.isVirtualDevice, rgbConstituents: rgb, supportsExactPrimaryLock: supportsExactLock)
+    }
+
+    private func rgbIdentityDescription(_ constituents: [CameraLensCandidate]) -> String {
+        constituents.map { "\($0.id):\($0.kind.rawValue):virtual=\($0.isVirtual)" }.joined(separator: "|")
+    }
+
+    /// 日志与决策使用同一份属性读数，以便区分 primary 缺失、非 RGB、错误 ID 与锁定未生效。
+    private func auxiliaryIdentityRejection(for selected: CameraLensOption, configuredInputID: String,
+                                            configuredKind: MainCameraAuxiliaryKind,
+                                            phase: MainCameraIdentityPhase) -> MainCameraIdentityRejection? {
+        let device = deviceInput?.device
+        let input = device.flatMap { auxiliaryCandidate(for: $0) }
+        let primary = device?.activePrimaryConstituent
+        let primaryIdentity = primary.map {
+            MainCameraPrimaryIdentity(id: $0.uniqueID, rgbKind: physicalLensKind(for: $0.deviceType),
+                                      isVirtual: $0.isVirtualDevice)
+        }
+        let requestedLocked = device?.primaryConstituentDeviceSwitchingBehavior == .locked
+        let activeLocked = device?.activePrimaryConstituentDeviceSwitchingBehavior == .locked
+        let rejection = MainCameraCapturePolicy.identityRejection(for: selected,
+            configuredInputID: configuredInputID, configuredKind: configuredKind, currentInput: input,
+            phase: phase, primary: primaryIdentity, requestedPrimaryLocked: requestedLocked,
+            activePrimaryLocked: activeLocked)
+        TestLog.shared.record("main RGB identity phase=\(phase), running=\(session.isRunning), " +
+            "selectedID=\(selected.id), configuredInputID=\(configuredInputID), configuredKind=\(configuredKind), " +
+            "inputID=\(device?.uniqueID ?? "nil"), inputType=\(device?.deviceType.rawValue ?? "nil"), " +
+            "rgb=\(rgbIdentityDescription(input?.rgbConstituents ?? [])), " +
+            "primaryID=\(primary?.uniqueID ?? "nil"), primaryType=\(primary?.deviceType.rawValue ?? "nil"), " +
+            "primaryVirtual=\(primary.map { String($0.isVirtualDevice) } ?? "nil"), " +
+            "primaryIDMatches=\(primary?.uniqueID == selected.id), primaryIsWide=\(primaryIdentity?.rgbKind == .wide), " +
+            "requestedLocked=\(requestedLocked), activeLocked=\(activeLocked), " +
+            "rejection=\(rejection?.rawValue ?? "none")", category: "camera")
+        return rejection
     }
 
     private func physicalLensKind(for type: AVCaptureDevice.DeviceType) -> CameraLensKind? {
