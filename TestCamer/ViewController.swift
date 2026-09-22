@@ -57,6 +57,10 @@ final class ViewController: UIViewController {
     private let retakeButton = UIButton(type: .system)
     private let saveButton = UIButton(type: .system)
     private let cameraControls = UIStackView()
+    private let rearLensContainer = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
+    private let rearLensStack = UIStackView()
+    private var displayedLensOptions: [CameraLensOption] = []
+    private var rearLensButtons: [String: UIButton] = [:]
     private let resultControls = UIStackView()
     private let focusIndicator = UIView()
 
@@ -346,21 +350,45 @@ private extension ViewController {
     }
 
     @objc func switchTapped() {
-        guard !isCapturing, !isSwitching, !isStarting, capturedImage == nil else { return }
+        guard !isCapturing, !isSwitching, !isStarting, !isExportingLog,
+              capturedImage == nil, cameraState?.isRunning == true else { return }
         isSwitching = true
         updateControlAvailability()
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
         Task {
-            defer { isSwitching = false; updateControlAvailability() }
-            do {
-                cameraState = try await camera.switchCamera()
+            defer {
+                isSwitching = false
                 lastZoomFactor = cameraState?.zoomFactor ?? 1
                 updatePreviewOrientation()
-                updateFlashButton()
-                updateDepthPanel()
+                updateControlAvailability()
+            }
+            do {
+                cameraState = try await camera.switchCamera()
             } catch {
                 cameraState = try? await camera.currentState()
-                updateDepthPanel()
+                presentError(error)
+            }
+        }
+    }
+
+    func selectRearLens(id: String) {
+        guard !isCapturing, !isSwitching, !isStarting, !isExportingLog, capturedImage == nil,
+              let state = cameraState, state.isRunning, !state.isFront,
+              state.rearLensOptions.contains(where: { $0.id == id }) else { return }
+        isSwitching = true
+        updateControlAvailability()
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        Task {
+            defer {
+                isSwitching = false
+                lastZoomFactor = cameraState?.zoomFactor ?? 1
+                updatePreviewOrientation()
+                updateControlAvailability()
+            }
+            do {
+                cameraState = try await camera.selectRearLens(id: id)
+            } catch {
+                cameraState = try? await camera.currentState()
                 presentError(error)
             }
         }
@@ -462,7 +490,8 @@ private extension ViewController {
     }
 
     @objc func handlePinch(_ gesture: UIPinchGestureRecognizer) {
-        guard capturedImage == nil, !isCapturing, !isSwitching, cameraState?.isRunning == true else { return }
+        guard capturedImage == nil, !isCapturing, !isSwitching, !isStarting, !isExportingLog,
+              cameraState?.isRunning == true else { return }
         if gesture.state == .began {
             lastZoomFactor = cameraState?.zoomFactor ?? 1
         }
@@ -525,6 +554,7 @@ private extension ViewController {
         cameraControls.addArrangedSubview(shutterButton)
         cameraControls.addArrangedSubview(switchButton)
         view.addSubview(cameraControls)
+        setupRearLensControls()
 
         resultControls.axis = .horizontal
         resultControls.alignment = .center
@@ -637,6 +667,79 @@ private extension ViewController {
         button.addTarget(self, action: action, for: .touchUpInside)
     }
 
+    func setupRearLensControls() {
+        rearLensContainer.translatesAutoresizingMaskIntoConstraints = false
+        rearLensContainer.layer.cornerRadius = 26
+        rearLensContainer.clipsToBounds = true
+        rearLensContainer.isHidden = true
+        view.addSubview(rearLensContainer)
+
+        rearLensStack.axis = .horizontal
+        rearLensStack.alignment = .fill
+        rearLensStack.distribution = .fillEqually
+        rearLensStack.spacing = 4
+        rearLensStack.translatesAutoresizingMaskIntoConstraints = false
+        rearLensContainer.contentView.addSubview(rearLensStack)
+
+        NSLayoutConstraint.activate([
+            rearLensContainer.centerXAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerXAnchor),
+            rearLensContainer.bottomAnchor.constraint(equalTo: cameraControls.topAnchor, constant: -14),
+            rearLensContainer.leadingAnchor.constraint(greaterThanOrEqualTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 20),
+            rearLensContainer.trailingAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -20),
+            rearLensContainer.heightAnchor.constraint(equalToConstant: 52),
+            rearLensStack.topAnchor.constraint(equalTo: rearLensContainer.contentView.topAnchor, constant: 4),
+            rearLensStack.leadingAnchor.constraint(equalTo: rearLensContainer.contentView.leadingAnchor, constant: 4),
+            rearLensStack.trailingAnchor.constraint(equalTo: rearLensContainer.contentView.trailingAnchor, constant: -4),
+            rearLensStack.bottomAnchor.constraint(equalTo: rearLensContainer.contentView.bottomAnchor, constant: -4)
+        ])
+    }
+
+    func updateRearLensControls(ready: Bool) {
+        let lenses = cameraState?.isFront == false ? cameraState?.rearLensOptions ?? [] : []
+        if displayedLensOptions != lenses {
+            for button in rearLensButtons.values {
+                rearLensStack.removeArrangedSubview(button)
+                button.removeFromSuperview()
+            }
+            rearLensButtons.removeAll()
+            displayedLensOptions = lenses
+            for lens in lenses {
+                let button = UIButton(type: .system)
+                var config = UIButton.Configuration.filled()
+                config.title = lens.title
+                config.cornerStyle = .capsule
+                config.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12)
+                config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer {
+                    var attributes = $0
+                    attributes[AttributeScopes.UIKitAttributes.FontAttribute.self] = UIFont.systemFont(ofSize: 15, weight: .semibold)
+                    return attributes
+                }
+                button.configuration = config
+                button.accessibilityIdentifier = "rearLens-\(lens.id)"
+                button.accessibilityLabel = "\(lens.title)后置镜头"
+                button.accessibilityHint = "选择物理镜头，再次选择可恢复原生视角"
+                button.addAction(UIAction { [weak self] _ in
+                    self?.selectRearLens(id: lens.id)
+                }, for: .touchUpInside)
+                button.widthAnchor.constraint(greaterThanOrEqualToConstant: 68).isActive = true
+                rearLensStack.addArrangedSubview(button)
+                rearLensButtons[lens.id] = button
+            }
+        }
+
+        rearLensContainer.isHidden = capturedImage != nil || lenses.isEmpty
+        for lens in lenses {
+            guard let button = rearLensButtons[lens.id] else { continue }
+            let selected = cameraState?.selectedRearLensID == lens.id
+            button.isSelected = selected
+            button.configuration?.baseForegroundColor = selected ? .black : .white
+            button.configuration?.baseBackgroundColor = selected ? .systemYellow : UIColor.black.withAlphaComponent(0.25)
+            button.accessibilityTraits = selected ? [.button, .selected] : .button
+            button.isEnabled = ready
+            button.alpha = ready ? 1 : 0.45
+        }
+    }
+
     func configureShutterButton() {
         shutterButton.translatesAutoresizingMaskIntoConstraints = false
         shutterButton.accessibilityLabel = "拍照"
@@ -684,6 +787,7 @@ private extension ViewController {
         capturedImageView.image = image
         capturedImageView.isHidden = false
         cameraControls.isHidden = true
+        rearLensContainer.isHidden = true
         resultControls.isHidden = false
         depthPanel.isHidden = true
         resultInfoLabel.isHidden = false
@@ -909,18 +1013,26 @@ private extension ViewController {
         let active = supported && wantsDepth
         depthSwitch.setOn(active, animated: false)
         depthTitleLabel.text = supported ? "苹果景深 · v3" : "普通拍照 · v3"
-        if cameraState == nil {
-            depthHintLabel.text = "正在检测当前相机的原生深度能力…"
-        } else if !supported {
-            depthHintLabel.text = "当前相机不支持原生深度，仍可普通拍照。"
+        if let state = cameraState {
+            let zoom = String(format: "%.1f×", Double(state.zoomFactor))
+                .replacingOccurrences(of: ".0×", with: "×")
+            let fieldOfView = abs(state.zoomFactor - 1) < 0.001 ? "原生视角" : "数码变焦 \(zoom)"
+            let lensHint = "\(state.activeLensName) · \(fieldOfView)"
+            if !supported {
+                depthHintLabel.text = "\(lensHint)\n当前镜头配置仅支持普通拍照"
+            } else {
+                let captureHint = active ? "景深可用 · 拍完可换焦、调光圈" : "景深可用 · 当前已关闭"
+                depthHintLabel.text = "\(lensHint)\n\(captureHint)"
+            }
         } else {
-            depthHintLabel.text = active ? "点选清晰主体后拍摄 · 成片生成景深\n拍完可换焦、调光圈并保存编辑" : "景深已关闭 · 成片不添加算法虚化"
+            depthHintLabel.text = "正在检测当前镜头的景深能力…"
         }
         let aperture = DepthCapturePolicy.aperture(sliderValue: apertureSlider.value)
         apertureLabel.text = String(format: "f/%.1f", aperture)
         apertureSlider.accessibilityValue = apertureLabel.text
         apertureSlider.alpha = active ? 1 : 0.35
-        let available = cameraState?.isRunning == true && capturedImage == nil && !isCapturing && !isSwitching && !isStarting
+        let available = cameraState?.isRunning == true && capturedImage == nil && !isCapturing
+            && !isSwitching && !isStarting && !isExportingLog
         depthSwitch.isEnabled = supported && available
         apertureSlider.isEnabled = active && available
     }
@@ -941,5 +1053,6 @@ private extension ViewController {
         legacyCompareButton.isEnabled = !isSaving
         diagnosticsButton.isEnabled = processedPhoto != nil && !isSaving
         updateDepthPanel()
+        updateRearLensControls(ready: ready)
     }
 }

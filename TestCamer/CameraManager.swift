@@ -17,6 +17,9 @@ struct CameraState: Sendable {
     let zoomFactor: CGFloat
     let isRunning: Bool
     let deviceName: String
+    let rearLensOptions: [CameraLensOption]
+    let selectedRearLensID: String?
+    let activeLensName: String
 }
 
 enum CameraEvent: Sendable {
@@ -39,6 +42,9 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
     private var userDidTapFocus = false
     private var eventHandler: (@Sendable (CameraEvent) -> Void)?
     private var observers: [NSObjectProtocol] = []
+    private var rearLensOptions: [CameraLensOption] = []
+    private var selectedRearDeviceID: String?
+    private var rearRawZoom: Double = 1
 
     private final class PendingCapture {
         let id: Int64
@@ -130,6 +136,8 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
             guard pendingCapture == nil else { throw CameraError.busy }
             TestLog.shared.record("switch camera requested", category: "camera")
             let previous = position
+            let previousRearID = selectedRearDeviceID
+            let previousRearZoom = rearRawZoom
             let next: AVCaptureDevice.Position = previous == .back ? .front : .back
             let restart = wantsToRun
             if session.isRunning { session.stopRunning() }
@@ -138,6 +146,8 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
             } catch {
                 // 不能因为切换失败把原来的输入永远移除，留下黑屏。
                 TestLog.shared.record("[Camera] switch failed: \(error); restoring previous input")
+                selectedRearDeviceID = previousRearID
+                rearRawZoom = previousRearZoom
                 try? configureSession(for: previous)
                 if restart && isConfigured { session.startRunning() }
                 throw error
@@ -147,17 +157,42 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
         }
     }
 
-    /// 高频手势不为每帧创建 Task。更新和拍照请求仍在同一串行队列执行。
+    /// 直接切换到指定物理设备；不因光线、距离或深度能力改用其他镜头。
+    func selectRearLens(id: String) async throws -> CameraState {
+        try await onSessionQueue { [self] in
+            guard pendingCapture == nil else { throw CameraError.busy }
+            guard position == .back, let lens = rearLensOptions.first(where: { $0.id == id }) else {
+                throw CameraError.unavailable
+            }
+            let previousID = selectedRearDeviceID
+            let previousZoom = rearRawZoom
+            let restart = wantsToRun
+            if session.isRunning { session.stopRunning() }
+            do {
+                try configureSession(for: .back, rearLensID: id, rawZoom: 1)
+            } catch {
+                try? configureSession(for: .back, rearLensID: previousID, rawZoom: previousZoom)
+                if restart && isConfigured { session.startRunning() }
+                throw error
+            }
+            if restart { session.startRunning() }
+            TestLog.shared.record("physical lens selected=\(lens.title), " +
+                "device=\(deviceInput?.device.deviceType.rawValue ?? "unknown"), digitalZoom=\(rearRawZoom), " +
+                "depth=\(currentDepthSupported)", category: "camera")
+            return makeState()
+        }
+    }
+
+    /// 捏合只裁切当前物理镜头，不切换其他镜头。
     func setZoomFactor(_ factor: CGFloat) {
         sessionQueue.async { [self] in
-            guard pendingCapture == nil, let device = deviceInput?.device else { return }
+            guard pendingCapture == nil, factor.isFinite, let device = deviceInput?.device else { return }
             do {
-                try device.lockForConfiguration()
-                defer { device.unlockForConfiguration() }
-                userDidTapFocus = false // 变焦改变构图，旧点按不再用于下一张的算法选焦。
-                device.videoZoomFactor = CGFloat(DepthCapturePolicy.clampedZoom(
-                    Double(factor), minimum: Double(device.minAvailableVideoZoomFactor),
-                    maximum: Double(device.maxAvailableVideoZoomFactor)))
+                do {
+                    session.beginConfiguration()
+                    defer { session.commitConfiguration() }
+                    try applyZoom(Double(factor), to: device)
+                }
                 eventHandler?(.ready(makeState()))
             } catch {
                 TestLog.shared.record("[Camera] zoom rejected: \(error.localizedDescription)")
@@ -224,8 +259,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
                 if photoOutput.maxPhotoDimensions.width > 0 {
                     settings.maxPhotoDimensions = photoOutput.maxPhotoDimensions
                 }
-                let useDepth = options.enabled && photoOutput.isDepthDataDeliverySupported
-                    && photoOutput.isDepthDataDeliveryEnabled
+                let useDepth = options.enabled && currentDepthSupported
                 settings.isDepthDataDeliveryEnabled = useDepth
                 settings.isDepthDataFiltered = true
                 // 仅内存容器保留原生深度和标定元数据，供苹果景深 factory 使用。
@@ -252,6 +286,8 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
                 if let device = deviceInput?.device {
                     TestLog.shared.record("deviceType=\(device.deviceType.rawValue), position=\(device.position.rawValue), zoom=\(device.videoZoomFactor), focusMode=\(device.focusMode.rawValue), adjustingFocus=\(device.isAdjustingFocus), adjustingExposure=\(device.isAdjustingExposure), ISO=\(device.iso), exposureSeconds=\(device.exposureDuration.seconds)", category: "capture", captureID: id)
                 }
+                TestLog.shared.record("physicalInput=\(deviceInput?.device.isVirtualDevice == false), " +
+                    "depthAtZoom=\(currentDepthSupported)", category: "capture", captureID: id)
                 photoOutput.capturePhoto(with: settings, delegate: self)
 
                 sessionQueue.asyncAfter(deadline: .now() + DepthCapturePolicy.captureTimeout) { [weak self] in
@@ -294,6 +330,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
         } : nil
         TestLog.shared.record("delivered bytes=\(data?.count ?? 0), depth=\(hasDepth), copiedDepth=\(frozenSnapshot != nil), depthCopyError=\(frozenIssue ?? "none"), matteDelivered=\(photo.portraitEffectsMatte != nil), matteCopied=\(frozenMatte != nil)", category: "capture", captureID: id)
         let sourceType = photo.sourceDeviceType?.rawValue ?? "unknown"
+        TestLog.shared.record("photo sourceDeviceType=\(sourceType), deliveredDepth=\(hasDepth)", category: "capture", captureID: id)
         sessionQueue.async { [self] in
             guard let pending = pendingCapture, pending.id == id else { return }
             if let error {
@@ -343,60 +380,58 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
         }
     }
 
-    private func configureSession(for target: AVCaptureDevice.Position) throws {
+    private func configureSession(for target: AVCaptureDevice.Position, rearLensID: String? = nil,
+                                  rawZoom: Double? = nil) throws {
         dispatchPrecondition(condition: .onQueue(sessionQueue))
-        TestLog.shared.record("configure start position=\(target.rawValue)", category: "camera")
+        let device: AVCaptureDevice
+        let requestedRawZoom: Double
+        if target == .back {
+            // 只发现三种物理 RGB 镜头，虚拟双摄、三摄和 LiDAR 组合不参与选择。
+            let physicalTypes: [AVCaptureDevice.DeviceType] = [
+                .builtInUltraWideCamera, .builtInWideAngleCamera, .builtInTelephotoCamera
+            ]
+            let discovered = AVCaptureDevice.DiscoverySession(deviceTypes: physicalTypes,
+                mediaType: .video, position: .back).devices
+            let candidates = discovered.compactMap { device -> CameraLensCandidate? in
+                guard let kind = physicalLensKind(for: device.deviceType) else { return nil }
+                return CameraLensCandidate(id: device.uniqueID, kind: kind, isVirtual: device.isVirtualDevice)
+            }
+            rearLensOptions = CameraLensPolicy.options(candidates: candidates)
+            guard let choice = CameraLensPolicy.select(requestedID: rearLensID ?? selectedRearDeviceID,
+                                                       options: rearLensOptions),
+                  let physical = discovered.first(where: { $0.uniqueID == choice.id }),
+                  !physical.isVirtualDevice else { throw CameraError.unavailable }
+            device = physical
+            requestedRawZoom = rawZoom ?? rearRawZoom
+        } else {
+            guard let front = AVCaptureDevice.default(.builtInTrueDepthCamera, for: .video, position: .front)
+                    ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front) else {
+                throw CameraError.unavailable
+            }
+            device = front
+            requestedRawZoom = 1
+        }
+        // 先解析并创建指定输入，失败时不能改用另一颗镜头。
+        let input = try AVCaptureDeviceInput(device: device)
+        TestLog.shared.record("configure start position=\(target.rawValue), " +
+            "deviceType=\(device.deviceType.rawValue), isVirtual=\(device.isVirtualDevice)", category: "camera")
         isConfigured = false
         session.beginConfiguration()
         defer { session.commitConfiguration() }
-        session.sessionPreset = .photo
+        disableDepthDelivery()
         if let deviceInput { session.removeInput(deviceInput) }
         deviceInput = nil
+        session.sessionPreset = .photo
         if !session.outputs.contains(photoOutput) {
             guard session.canAddOutput(photoOutput) else { throw CameraError.configurationFailed }
             session.addOutput(photoOutput)
         }
         photoOutput.maxPhotoQualityPrioritization = .quality
+        guard session.canAddInput(input) else { throw CameraError.configurationFailed }
+        session.addInput(input)
+        deviceInput = input
 
-        // 不根据机型名称硬编码“支持”。逐个接入原生相机，用当前 photoOutput 的实际能力判定。
-        let types: [AVCaptureDevice.DeviceType] = target == .front
-            ? [.builtInTrueDepthCamera]
-            : [.builtInDualWideCamera, .builtInDualCamera, .builtInTripleCamera, .builtInLiDARDepthCamera]
-        for type in types {
-            guard let device = AVCaptureDevice.default(type, for: .video, position: target),
-                  let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input) else { continue }
-            session.addInput(input)
-            let supported = photoOutput.isDepthDataDeliverySupported
-            TestLog.shared.record("[Capability] \(device.localizedName), type=\(type.rawValue), photoDepth=\(supported), " +
-                  "activeFormatDepthVariants=\(device.activeFormat.supportedDepthDataFormats.count)")
-            if supported {
-                deviceInput = input
-                break
-            }
-            session.removeInput(input)
-        }
-        if deviceInput == nil {
-            guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: target),
-                  let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input) else {
-                throw CameraError.unavailable
-            }
-            session.addInput(input)
-            deviceInput = input
-            TestLog.shared.record("[Capability] native depth unavailable; ordinary photo fallback")
-        }
-        guard let device = deviceInput?.device else { throw CameraError.configurationFailed }
-        if photoOutput.isDepthDataDeliverySupported {
-            photoOutput.isDepthDataDeliveryEnabled = true
-        } else {
-            photoOutput.isDepthDataDeliveryEnabled = false
-        }
-        photoOutput.isPortraitEffectsMatteDeliveryEnabled = photoOutput.isDepthDataDeliveryEnabled
-            && photoOutput.isPortraitEffectsMatteDeliverySupported
-        let wantedMattes: [AVSemanticSegmentationMatte.MatteType] = [.hair, .glasses]
-        photoOutput.enabledSemanticSegmentationMatteTypes = photoOutput.isDepthDataDeliveryEnabled
-            ? photoOutput.availableSemanticSegmentationMatteTypes.filter { wantedMattes.contains($0) } : []
-
-        // 使用当前格式真实支持的尺寸，优先约 12 MP，避免默认去做 48 MP 大内存景深渲染。
+        // 仅使用这颗物理镜头本身的能力；没有深度时保持它进行普通拍照。
         let dimensions = device.activeFormat.supportedMaxPhotoDimensions.sorted {
             Int64($0.width) * Int64($0.height) < Int64($1.width) * Int64($1.height)
         }
@@ -405,31 +440,100 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
         }) ?? dimensions.first
         if let preferred { photoOutput.maxPhotoDimensions = preferred }
 
+        try applyZoom(requestedRawZoom, to: device)
         try device.lockForConfiguration()
         defer { device.unlockForConfiguration() }
         if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
         if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
         if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { device.whiteBalanceMode = .continuousAutoWhiteBalance }
-        // Dual-wide 的虚拟 1x 可能是超广角；优先切换点，并始终尊重系统的深度模式变焦范围。
-        let desiredZoom = device.virtualDeviceSwitchOverVideoZoomFactors.first?.doubleValue ?? 1
-        device.videoZoomFactor = CGFloat(DepthCapturePolicy.clampedZoom(
-            desiredZoom, minimum: Double(device.minAvailableVideoZoomFactor),
-            maximum: Double(device.maxAvailableVideoZoomFactor)))
         userDidTapFocus = false
         position = target
+        if target == .back { selectedRearDeviceID = device.uniqueID }
         isConfigured = true
-        TestLog.shared.record("[Camera] configured depth=\(photoOutput.isDepthDataDeliveryEnabled), " +
-              "zoom=\(device.videoZoomFactor), available=[\(device.minAvailableVideoZoomFactor), \(device.maxAvailableVideoZoomFactor)], " +
-              "photo=\(photoOutput.maxPhotoDimensions.width)x\(photoOutput.maxPhotoDimensions.height), matteSupported=\(photoOutput.isPortraitEffectsMatteDeliverySupported), matteEnabled=\(photoOutput.isPortraitEffectsMatteDeliveryEnabled)", category: "camera")
+        TestLog.shared.record("[Camera] configured physical=\(!device.isVirtualDevice), depth=\(currentDepthSupported), " +
+            "digitalZoom=\(device.videoZoomFactor), " +
+            "available=[\(device.minAvailableVideoZoomFactor), \(device.maxAvailableVideoZoomFactor)], " +
+            "photo=\(photoOutput.maxPhotoDimensions.width)x\(photoOutput.maxPhotoDimensions.height)", category: "camera")
+    }
+
+    private func physicalLensKind(for type: AVCaptureDevice.DeviceType) -> CameraLensKind? {
+        switch type {
+        case .builtInUltraWideCamera: return .ultraWide
+        case .builtInWideAngleCamera: return .wide
+        case .builtInTelephotoCamera: return .telephoto
+        default: return nil
+        }
+    }
+
+    private func depthZoomRanges(for device: AVCaptureDevice) -> [ClosedRange<Double>] {
+        if #available(iOS 17.2, *) {
+            return device.activeFormat.supportedVideoZoomRangesForDepthDataDelivery.map {
+                Double($0.lowerBound)...Double($0.upperBound)
+            }
+        }
+        return device.activeFormat.supportedVideoZoomFactorsForDepthDataDelivery.map {
+            Double($0)...Double($0)
+        }
+    }
+
+    private func zoomPlan(_ rawZoom: Double, for device: AVCaptureDevice) -> CameraZoomPlan {
+        CameraZoomPolicy.plan(requestedRawZoom: rawZoom,
+            maximumRawZoom: Double(device.activeFormat.videoMaxZoomFactor), displayMultiplier: 1,
+            depthAvailable: photoOutput.isDepthDataDeliverySupported,
+            depthRanges: depthZoomRanges(for: device))
+    }
+
+    private var currentDepthSupported: Bool {
+        guard let device = deviceInput?.device, photoOutput.isDepthDataDeliveryEnabled else { return false }
+        return zoomPlan(Double(device.videoZoomFactor), for: device).depthEnabled
+    }
+
+    private func disableDepthDelivery() {
+        photoOutput.enabledSemanticSegmentationMatteTypes = []
+        photoOutput.isPortraitEffectsMatteDeliveryEnabled = false
+        photoOutput.isDepthDataDeliveryEnabled = false
+    }
+
+    /// 调用方已在 sessionQueue 的配置事务中。非法深度倍率先关闭深度，再数码变焦。
+    private func applyZoom(_ requested: Double, to device: AVCaptureDevice) throws {
+        let plan = zoomPlan(requested, for: device)
+        try device.lockForConfiguration()
+        defer { device.unlockForConfiguration() }
+        if photoOutput.isDepthDataDeliveryEnabled && !plan.depthEnabled { disableDepthDelivery() }
+        device.videoZoomFactor = CGFloat(plan.rawZoomFactor)
+        if plan.depthEnabled && !photoOutput.isDepthDataDeliveryEnabled {
+            photoOutput.isDepthDataDeliveryEnabled = true
+        }
+        // 深度配置若改变数码倍率，优先保留用户构图并显示普通拍照状态。
+        if abs(Double(device.videoZoomFactor) - plan.rawZoomFactor) > 0.000_001 {
+            disableDepthDelivery()
+            device.videoZoomFactor = CGFloat(plan.rawZoomFactor)
+        }
+        let depthEnabled = photoOutput.isDepthDataDeliveryEnabled
+        let portraitEnabled = depthEnabled && photoOutput.isPortraitEffectsMatteDeliverySupported
+        if photoOutput.isPortraitEffectsMatteDeliveryEnabled != portraitEnabled {
+            photoOutput.isPortraitEffectsMatteDeliveryEnabled = portraitEnabled
+        }
+        let wantedMattes: [AVSemanticSegmentationMatte.MatteType] = [.hair, .glasses]
+        let mattes = depthEnabled
+            ? photoOutput.availableSemanticSegmentationMatteTypes.filter { wantedMattes.contains($0) } : []
+        if photoOutput.enabledSemanticSegmentationMatteTypes != mattes {
+            photoOutput.enabledSemanticSegmentationMatteTypes = mattes
+        }
+        userDidTapFocus = false
+        if device.position == .back { rearRawZoom = Double(device.videoZoomFactor) }
     }
 
     private func makeState() -> CameraState {
         dispatchPrecondition(condition: .onQueue(sessionQueue))
-        return CameraState(isFront: position == .front, hasFlash: deviceInput?.device.hasFlash ?? false,
-                           depthSupported: photoOutput.isDepthDataDeliverySupported && photoOutput.isDepthDataDeliveryEnabled,
-                           zoomFactor: deviceInput?.device.videoZoomFactor ?? 1,
-                           isRunning: session.isRunning && !session.isInterrupted,
-                           deviceName: deviceInput?.device.localizedName ?? "")
+        let device = deviceInput?.device
+        let lens = rearLensOptions.first { $0.id == device?.uniqueID }
+        return CameraState(isFront: position == .front, hasFlash: device?.hasFlash ?? false,
+            depthSupported: currentDepthSupported, zoomFactor: device?.videoZoomFactor ?? 1,
+            isRunning: session.isRunning && !session.isInterrupted, deviceName: device?.localizedName ?? "",
+            rearLensOptions: position == .back ? rearLensOptions : [],
+            selectedRearLensID: position == .back ? lens?.id : nil,
+            activeLensName: position == .front ? "前置" : (lens?.title ?? "后置"))
     }
 
     private func finishCapture(id: Int64, result: Result<CapturedPhoto, Error>) {

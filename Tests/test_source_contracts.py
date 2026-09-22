@@ -20,11 +20,8 @@ class SourceContracts(unittest.TestCase):
         self.assertNotRegex(src, r'CIKernel\s*\(|CIColorKernel\s*\(')
         ui = self.read('ViewController.swift')
         self.assertIn('updateDepthPanel() // 仅更新下一次拍照参数；不渲染预览。', ui)
-    def test_virtual_camera_candidates_and_zoom_limits(self):
-        c = self.read('CameraManager.swift')
-        for token in ['.builtInDualWideCamera', '.builtInDualCamera', '.builtInTrueDepthCamera',
-                      'minAvailableVideoZoomFactor', 'maxAvailableVideoZoomFactor']:
-            self.assertIn(token, c)
+    # 后置已改为严格物理镜头。候选过滤、精确 ID 选择和变焦范围由
+    # CameraLensPolicyTests / CameraZoomPolicyTests 执行行为检查。
     def test_disparity_uses_float_and_row_stride(self):
         c = self.read('NativeDepthSnapshot.swift')
         for token in ['kCVPixelFormatType_DisparityFloat32', 'CVPixelBufferGetBytesPerRow',
