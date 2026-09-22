@@ -1,3 +1,6 @@
+Verification environment: Linux x86_64, Swift 6.2.1.
+Only the commands printed below were run; Apple SDK build/render/device tests are NOT VERIFIED.
+
 == Swift version ==
 Swift version 6.2.1 (swift-6.2.1-RELEASE)
 Target: x86_64-unknown-linux-gnu
@@ -30,19 +33,85 @@ PASS: 旧机型保留普通拍照
 PASS: 渲染失败不伪装成功
 
 25 policy checks passed.
+PASS: EXIF 1 pixel orientation
+PASS: EXIF 1 dimensions
+PASS: EXIF 1 point and depth agree
+PASS: EXIF 2 pixel orientation
+PASS: EXIF 2 dimensions
+PASS: EXIF 2 point and depth agree
+PASS: EXIF 3 pixel orientation
+PASS: EXIF 3 dimensions
+PASS: EXIF 3 point and depth agree
+PASS: EXIF 4 pixel orientation
+PASS: EXIF 4 dimensions
+PASS: EXIF 4 point and depth agree
+PASS: EXIF 5 pixel orientation
+PASS: EXIF 5 dimensions
+PASS: EXIF 5 point and depth agree
+PASS: EXIF 6 pixel orientation
+PASS: EXIF 6 dimensions
+PASS: EXIF 6 point and depth agree
+PASS: EXIF 7 pixel orientation
+PASS: EXIF 7 dimensions
+PASS: EXIF 7 point and depth agree
+PASS: EXIF 8 pixel orientation
+PASS: EXIF 8 dimensions
+PASS: EXIF 8 point and depth agree
+PASS: Reject empty map
+PASS: Reject incorrect buffer length
+PASS: Reject size overflow
+PASS: Reject NaN tap
+PASS: Reject out-of-image tap
+PASS: Closer object blurs
+PASS: Farther object blurs
+PASS: Focus plane stays clear
+PASS: Near and far are not reversed
+PASS: Nonempty depth coverage
+PASS: Finite normalized CoC
+PASS: f/16 much weaker than f/1.4
+PASS: Radius scales with output resolution
+PASS: Monotonic radius f/1.4
+PASS: Monotonic radius f/1.8
+PASS: Monotonic radius f/2.0
+PASS: Monotonic radius f/2.8
+PASS: Monotonic radius f/4.0
+PASS: Monotonic radius f/5.6
+PASS: Monotonic radius f/8.0
+PASS: Monotonic radius f/11.0
+PASS: Monotonic radius f/16.0
+PASS: NaN aperture sanitised
+PASS: Disparity scale does not change relative effect
+PASS: Disconnected object at same depth also stays sharp
+PASS: Flat scene is not forced to blur
+PASS: One outlier cannot stretch a flat scene
+PASS: Invalid depth never fakes success
+PASS: Unknown is not silently treated as background
+PASS: Invalid user-selected region is reported, not moved
+PASS: Identical output is not marked visibly blurred
+PASS: Visible pixel change is detected
+PASS: No eligible region cannot count as successful blur
+PASS: Mismatched measurement buffer rejected
+
+58 depth math checks; 0 failures.
 == Source contracts ==
-test_depth_renderer_and_explicit_fallback (__main__.SourceContracts.test_depth_renderer_and_explicit_fallback) ... ok
-test_ios17_and_no_implicit_main_actor_for_worker (__main__.SourceContracts.test_ios17_and_no_implicit_main_actor_for_worker) ... ok
-test_jpeg_saved_from_encoded_result_not_ui_preview (__main__.SourceContracts.test_jpeg_saved_from_encoded_result_not_ui_preview) ... ok
-test_no_focus_persistence_or_third_party_sources (__main__.SourceContracts.test_no_focus_persistence_or_third_party_sources) ... ok
-test_ordinary_preview_remains_without_stream_processors (__main__.SourceContracts.test_ordinary_preview_remains_without_stream_processors) ... ok
-test_photo_output_prepares_native_depth (__main__.SourceContracts.test_photo_output_prepares_native_depth) ... ok
-test_preview_does_not_require_ios26_scene_geometry (__main__.SourceContracts.test_preview_does_not_require_ios26_scene_geometry) ... ok
-test_terminal_capture_callback_and_identity_guard (__main__.SourceContracts.test_terminal_capture_callback_and_identity_guard) ... ok
-test_virtual_camera_candidates_and_zoom_limits (__main__.SourceContracts.test_virtual_camera_candidates_and_zoom_limits) ... ok
+test_depth_renderer_and_explicit_fallback (test_source_contracts.SourceContracts.test_depth_renderer_and_explicit_fallback) ... ok
+test_disparity_uses_float_and_row_stride (test_source_contracts.SourceContracts.test_disparity_uses_float_and_row_stride) ... ok
+test_ios17_and_worker_isolation (test_source_contracts.SourceContracts.test_ios17_and_worker_isolation) ... ok
+test_no_foreground_segmentation_or_depth_model_fallback (test_source_contracts.SourceContracts.test_no_foreground_segmentation_or_depth_model_fallback) ... ok
+test_no_gamma_conversion_for_mask_intermediate (test_source_contracts.SourceContracts.test_no_gamma_conversion_for_mask_intermediate) ... ok
+test_only_baked_jpeg_is_saved_and_no_focus_persistence (test_source_contracts.SourceContracts.test_only_baked_jpeg_is_saved_and_no_focus_persistence) ... ok
+test_ordinary_preview_has_no_stream_processor (test_source_contracts.SourceContracts.test_ordinary_preview_has_no_stream_processor) ... ok
+test_photo_output_prepares_native_depth (test_source_contracts.SourceContracts.test_photo_output_prepares_native_depth) ... ok
+test_result_diagnostics_and_weak_effect_compare (test_source_contracts.SourceContracts.test_result_diagnostics_and_weak_effect_compare) ... ok
+test_sharp_region_preserves_full_resolution (test_source_contracts.SourceContracts.test_sharp_region_preserves_full_resolution) ... ok
+test_terminal_callback_and_identity_guard (test_source_contracts.SourceContracts.test_terminal_callback_and_identity_guard) ... ok
+test_virtual_camera_candidates_and_zoom_limits (test_source_contracts.SourceContracts.test_virtual_camera_candidates_and_zoom_limits) ... ok
+test_direct_depth_is_transferred_not_only_boolean (test_v2_regressions.V2Regressions.test_direct_depth_is_transferred_not_only_boolean) ... ok
+test_renderer_has_continuous_near_and_far_blur (test_v2_regressions.V2Regressions.test_renderer_has_continuous_near_and_far_blur) ... ok
+test_success_requires_measured_output_change (test_v2_regressions.V2Regressions.test_success_requires_measured_output_change) ... ok
 
 ----------------------------------------------------------------------
-Ran 9 tests in 0.002s
+Ran 15 tests in 0.005s
 
 OK
 == XML / assets ==
@@ -57,5 +126,8 @@ TestCamer/Info.plist: OK
 TestCamer.xcodeproj/project.pbxproj: OK
 Local checks complete. iOS SDK build / signing / device effects are NOT covered.
 
-== Environment limitations ==
-xcodebuild unavailable in current Linux environment. No iOS SDK build, signing, device or visual test was performed.
+== Platform guards (not a test pass) ==
+verify_on_mac.sh exit=2
+本脚本需要 macOS 和完整 Xcode；当前系统不支持 iOS SDK 构建。
+verify_render_on_mac.sh exit=2
+SKIP / NOT VERIFIED: native rendering tests require macOS + Xcode, not Linux.

@@ -1,90 +1,104 @@
-# TestCamer · 拍后景深版
+# TestCamer · 拍后景深 v2
 
-在你上传的 **TestCamer 2.zip** 上修改，保留原 UIKit 工程、Storyboard 入口、普通相机预览、闪光灯、切换摄像头、双指缩放、点按硬件对焦、重拍和保存流程。不是另外做一个无关项目。
+## TestLog 使用方法
 
-## 打开和运行
+运行当前工程后自动记录日志，不需要连着 Xcode。拍摄页和成片页右上角均有 **导出 TestLog**；出现黑屏或拍摄失败后也可以导出。先复现问题，再点这个按钮，把导出的 `.log` 文件发来分析。若 App 意外退出，重新打开后立即导出即可保留退出前已写入的记录；它不是系统崩溃报告。
 
-解压后双击 `TestCamer.xcodeproj`，选择 **TestCamer** Scheme 和连接的 **iPhone 真机**，再运行。首次进入允许相机权限；点击保存时允许添加照片到相册。原工程的 Team 和 Bundle Identifier 保留；出现签名错误时，在 Signing & Capabilities 选择你自己的开发者 Team，并按需要修改 Bundle Identifier。
+日志包含设备/系统/版本、相机能力、每次拍摄编号、光圈/方向/变焦、深度与原生人物遮罩是否交付、人物保护选择或回退原因、处理各阶段耗时、结果与保存/权限错误。只记录诊断文字及聚合数值，不包含照片、完整深度图、聚焦坐标或人脸框。
 
-Deployment Target 已改成 **iOS 17.0**，界面仍是 UIKit，App 代码全部 Swift。使用能支持你真机系统版本的 Xcode；工程采用原有文件夹同步结构。没有第三方依赖、下载模型、API Key 或服务器配置。
+日志保存在 App 的 Application Support/TestLog 目录（以 `TestLog.swift` 默认路径为准），重启继续保留，最多保留 3 个约 1 MiB 的日志分段。导出会生成独立快照，后续拍摄不会修改已经导出的文件。日志只在本机生成，分享目标由你在系统分享面板选择。
 
-真实相机深度交付和拍摄质量需要 iPhone 真机验证。另提供 macOS 原生 Core Image 像素回归和 iOS SDK 构建脚本，具体验证边界见下文。
+> 2026-09-21 真机画质修订（在正在运行的 Downloads 工程上修改）：已从 iPhone 17 导出失败成片、同帧原图预览和实际虚化遮罩，确认脸/手被错误划入虚化区。新增同帧人物保护，优先原生 portrait matte，缺失时用 Apple Vision；它只保护清晰主体，虚化仍要求真实相机深度。取消近景大范围扩张填色；修正相对视差对未知零点的依赖，并补充数值、方向和清晰主体回归。已在 macOS 运行渲染测试、通过 iOS SDK 签名构建；完整真实场景的新快门视觉验收尚未完成。以下旧版交付记录保留为历史说明。
 
-## 这次实现的交互
+在用户上传的 `TestCamer 2.zip` 及上一版 `TestCamer_PostCaptureDepth.zip` 上继续修改。保留原 UIKit / Storyboard 工程、普通取景、闪光灯、切换镜头、点按对焦、缩放、重拍和保存流程；不是另起一个无关 Demo，也不是重新复刻参考 App 的整套 UI。
 
-进入后是普通相机画面，不运行实时虚化。顶部新增“拍后景深”开关和虚拟光圈，默认 f/1.8，可选 f/1.4～f/16；调节它只影响下一张照片。点按画面同时指定硬件对焦和下一张照片的景深清晰区域。
+**普通预览 → 拍前点选主体、选虚拟光圈 → 拍照获取原生深度 → 后台生成景深 → 对比／保存成片。**
 
-按快门后冻结本张照片的景深开关、虚拟光圈、临时点按焦点、方向和镜像信息，在同一次拍摄中获取照片与原生深度。等照片完成处理后，后台执行 Core Image 景深渲染，再显示成片。
+本版不保存聚焦位置，不做拍后重新对焦。所有 App 源码为 Swift，只调用苹果原生框架；无第三方运行 SDK、自定义 Metal shader、外部深度模型、网络请求或模型下载。
 
-结果页完整显示照片，标注“景深成片”或具体的普通照片降级原因，以及实际像素尺寸。景深成功时可按住“看原图”，这只是当前结果的内存对比，不是编辑器。点击保存写入完整分辨率的成片 JPEG；点击重拍清空本次内存数据并回到普通取景。
+## 直接打开运行
 
-## 明确不做的事情
+解压后打开 `TestCamer/TestCamer.xcodeproj`（已经位于本 README 所在目录时，直接打开 `TestCamer.xcodeproj`）。选择 **TestCamer** Scheme 和 iPhone 真机运行。第一次允许相机权限；保存时允许添加照片到相册。
 
-**不持久化聚焦位置，不创建 Recipe，不保存可重编辑原图/深度档案，不实现拍后重选焦点，也不保证系统“照片”App 能做重新对焦。** 当前只把平面化成片保存到相册。快门时的临时原文件可能包含系统深度附件，但只在内存中用于本次处理；最终重新编码的 JPEG 不复制这些辅助附件和相机私有元数据。
+使用支持真机系统版本的完整 Xcode。最低部署系统为 **iOS 17.0**；项目保留原工程的文件夹同步结构。原 Team 与 Bundle Identifier 保留，签名报错时，在 **Signing & Capabilities** 选择自己的 Team，必要时修改 Bundle Identifier。
 
-点按主体后，对焦位置只在本次拍摄中传给景深滤镜，并与照片/深度应用同一个 EXIF 方向和镜像。没有点按时先使用系统自动选择；若输出几乎未改变，再依据真实视差中的连续近景区域选择焦点重试。仍无明显变化时明确显示普通照片，不把滤镜返回图片当作景深成功。非人脸主体的边缘质量仍需真机实测。
+本版桌面显示名为 **TestCamer 景深v2**，拍摄页标题为 **拍后景深 · v2**，避免误测旧包。验证目标是用户的 iPhone 17 标准版，但代码按实际相机能力判断，不硬编码“某机型一定成功”。
 
-没有原生深度能力时仍可普通拍照，不用 AI 估计深度，也不采用全图高斯模糊或抠图后统一模糊背景来冒充景深。设备支持但本次没给深度、深度过于无效/没有明显层次、原生滤镜不可用、渲染失败或效果不明显时，也明确回退普通成片，不显示“景深成功”。
+**交付环境为 Linux，没有 Xcode / iOS SDK 或 iPhone；本工程尚未完成 Apple SDK 编译、签名安装、原生渲染执行和真机效果验收。下面的已执行检查不能替代这些步骤。**
 
-## 输出约定
+## 建议第一次这样测
 
-| 项目 | 本版约定 |
+打开后保持“拍后景深”开启，选择 **f/1.4**。让杯子或人物与远处的柜子、屏幕有明显距离；画面近处再放一个物体。点选需要清晰的主体内部，等普通取景中的物理对焦稳定后再按快门。
+
+成片出来后，按住 **看原图** 与同一次拍摄的处理前图像比较，松开恢复成片。再打开 **景深诊断**，检查深度是否交付、实际虚化分布以及输出是否发生变化。保持同样构图，用 **f/16** 重拍一次，应比 f/1.4 弱；这是两次拍摄，不是拍后编辑。
+
+不点按时，优先选择检测到的人脸中心附近的有效深度；没有可用人脸时使用画面中心。非居中杯子、叶片等物体请拍前点选。点按只为本张拍摄临时选焦，处理后不写入照片或文件；重拍时重新点选。
+
+## v2 实际改了什么
+
+| 环节 | 本版实现 |
 |---|---|
-| 相机照片尺寸 | 从当前格式真实支持的尺寸中，优先选择不超过约 12 MP 的最大尺寸；若没有则选最小支持尺寸，不虚构分辨率。 |
-| 成片文件 | sRGB、8 位普通 JPEG，编码质量 0.95；不是 RAW、HDR 保真或无损格式。 |
-| 结果页预览 | 最大边 1600 像素，单独用于显示；保存时不用这个缩略图。 |
-| 方向 | 照片与深度应用同一个 EXIF 方向，渲染和 JPEG 输出统一为正向；拍摄时冻结前后摄像头镜像。 |
-| 焦点和元数据 | 不持久化聚焦位置；最终 JPEG 不复制相机 Maker、深度附件等原始元数据；虚拟 f 值不伪装成真实 EXIF 光圈。 |
-| 构图 | 保留原 Demo 的满屏裁切预览；结果页完整显示照片，所以成片可能比取景显示范围更大。这版不另外裁成屏幕比例。 |
-| 耗时 | 显示处理状态，未承诺某个固定耗时；拍摄回调有 45 秒兜底超时，Core Image 实际耗时待真机测试。 |
+| 深度交付 | 直接复制同一次 `AVCapturePhoto.depthData` 的浮点视差和有效性信息，不再只传布尔值后依赖 HEIC 文件中的附件重读。 |
+| 焦平面 | 按本次点选／自动人脸／中心区域的有效深度确定清晰带；同一深度附近的椅背、桌面、其他物体也可以清晰，同时用人物 mask 保护选中的完整人物，避免同一个人的脸和手被切进不同的虚化层。 |
+| 虚化 | 计算近景、远景各自的连续虚化量，调用 Core Image 的可变半径滤镜；近景限制在已知区域内，远景尽量避免混入主体颜色；所选人物用同帧 mask 保持原图清晰。 |
+| 虚拟光圈 | f/1.4～f/16 实际参与半径和清晰带计算；半径随输出尺寸缩放，不把固定几个像素套到所有分辨率。 |
+| 清晰细节 | 虚化工作层最大边 2048 像素，最终清晰区域仍来自完整分辨率原图。不是把整张 2048 图放大后导出。 |
+| 结果检查 | 检查最终输出的目标虚化区域是否发生像素变化；变化很小时显示弱效果，而不是仅凭滤镜返回对象就提示成功。该检查不是画质或光学真实性保证。 |
+| 诊断 | 结果页显示真实渲染使用的主虚化分布、深度来源／质量、近远景覆盖率、耗时和输出变化指标。无有效深度时明确显示原因。 |
+| 保存 | 只保存完整尺寸的烘焙成片 JPEG。原图对比、深度及瞬时选焦只用于当前内存任务，不建立档案或 Recipe。 |
 
-## 主要改动文件
+照片与视差统一应用同一 EXIF 方向；异常比例不会被强行拉伸。无效深度不会当作最远背景，没有原生深度时也不会用抠图、全图模糊或 AI 假装成功。
 
-| 文件 | 修改内容 |
+## 输出和能力边界
+
+成片为 sRGB、8 位 JPEG，编码质量 0.95；不是 RAW、无损图像或 HDR 原样保真。相机尺寸从当前配置支持的尺寸中优先选择约 12 MP，结果页显示真实尺寸。显示预览最大边 1600，保存使用另一份完整分辨率 JPEG。
+
+普通预览沿用原 Demo 的满屏填充，结果页完整显示照片；两者可见构图范围可能不同。本版不增加裁剪功能。切换相机／变焦会清除上一轮点选，原生深度能力按当前配置检查；支持设备也可能在某次拍摄缺少可用深度。
+
+这是使用原生深度实现的可控景深近似，**不是对第三方私有散景算法、镜头光学或参考图片逐像素复刻的承诺**。细发丝、叶尖、细挂绳、透明物体、低纹理及深度缺失区域仍可能存在边缘误差；颜色引导只能改善边缘，不会凭空补出真实深度。原图中已经失焦或运动模糊的主体也不会被恢复清晰。
+
+虚拟 f 值是 App 的效果参数，不是硬件光圈，不写成照片的真实 EXIF FNumber。对焦坐标、焦平面值、人脸框、辅助深度不写入成片、JSON、用户默认设置或控制台；诊断中的“选择来源”只有类型说明。
+
+## 验证状态与复跑
+
+| 检查 | 本次交付状态 |
 |---|---|
-| `TestCamer/CameraManager.swift` | 接入原生深度相机、照片深度开关、同次照片与深度交付、方向/镜像冻结、回调按 uniqueID 匹配、异常/中断恢复、受限变焦。 |
-| `TestCamer/DepthPhotoProcessor.swift` | 拍后原生景深处理、点按/自动焦点、深度及像素变化检查、方向对齐、显示预览及完整成片 JPEG。 |
-| `TestCamer/DepthCapturePolicy.swift` | 新增可独立测试的虚拟光圈、变焦边界、深度样本有效性和降级结果规则。 |
-| `TestCamer/ViewController.swift` | 保留原界面基础，新增景深开关、光圈条、处理状态、结果信息与按住对比；保存完整 JPEG。 |
-| `AppDelegate.swift`、`SceneDelegate.swift` | 显式 UI 主线程隔离，保留原入口。 |
-| `TestCamer.xcodeproj` | 最低系统 17.0；取消对工作类型的隐式主线程隔离；新增共享运行 Scheme。 |
+| App 与原生测试代码的 Swift 语法解析 | 已执行；不包含 Apple SDK 类型检查。 |
+| 纯 Swift 数值／边界规则 | **25 条原有规则 + 58 条景深数学规则通过**，实际编译并运行。 |
+| 源码结构回归检查 | **15 项通过**；这是源码检查，不是设备测试。 |
+| 工程 plist、Storyboard、Scheme、资源 JSON | 已解析检查。 |
+| 原生 Core Image 合成图像测试 | 已提供代码，**未执行**；需要 Mac。 |
+| Xcode iOS SDK 编译、签名、真机拍摄及视觉效果 | **未执行／未验证**。 |
 
-原工程已有的注释尽量保留；新增关键路径含中文注释和 `print`，没有自定义 `.metal`、Objective-C 或 C++ 文件。
+实际本地输出：`Documentation/verification-local.txt`。校验清单：`Documentation/SHA256SUMS.txt`。
 
-## 检查与测试：区分已执行和未执行
-
-初始交付的检查环境为 Linux + Swift 6.2.1，当时执行了：6 个 App Swift 文件语法解析、25 条纯 Swift 值规则检查、9 项源码契约检查、Info.plist/pbxproj 语法检查和 XML/资源 JSON 解析。对应输出保存在 `Documentation/verification-local.txt`。
-
-**Swift 语法解析和源码契约不等于运行时效果测试。** 本次修复新增 `Tests/DepthRenderingTests.swift`：将带已知深度的非人脸偏心主体编码为 HEIC，再调用生产处理器，逐区域检查背景虚化、主体细节、光圈差异、方向/镜像和降级结果。它可在 Mac 上运行，但不能替代 iPhone 相机交付、权限、中断和实际视觉质量验收。最新验证记录见 `Documentation/景深修复验证.md`。
-
-复跑跨平台检查：
+跨平台本地检查：
 
 ```bash
 bash Scripts/verify_local.sh
 ```
 
-在装有完整 Xcode 的 Mac 上检查 SDK 构建：
+完整 Xcode 的 Mac 上，一次执行本地规则、iOS SDK 不签名构建和原生合成图像渲染测试：
 
 ```bash
 bash Scripts/verify_on_mac.sh
 ```
 
-后者先执行源码/规则及原生像素回归，再构建通用 iOS 目标，不安装、不签名、不替代真机测试。也可单独运行 `bash Scripts/verify_depth_rendering.sh`。手动操作项目运行更直接。真机测试步骤见 `Documentation/真机验收.md`。
+只运行原生渲染测试（macOS 14 或更新版本；不启动相机）：
 
-## Xcode 控制台关键日志
+```bash
+bash Scripts/verify_render_on_mac.sh
+```
 
-`[Capability]` 显示每个候选相机是否支持当前配置下的照片深度；`[Camera]` 显示启动、分辨率和合法变焦范围；`[Capture ...]` 显示是否请求深度、是否真正交付；`[Depth]` 显示深度样本范围、最终结果和渲染耗时。
+后两项在 Linux 上明确退出并标记未验证，不把跳过当通过。原生测试包含近／远景纹理减弱、清晰区域保留、八种方向对齐、透明覆盖归一化、2048 工作层与完整清晰细节、最终 JPEG 无深度附件及弱变化检测。即使这些合成测试在 Mac 通过，也仍需真机验证相机和真实照片。
 
-若界面显示普通照片，先检查结果提示和 `outcome`，不要只依据设备名称推断必然有可用深度。
+## 项目文件
 
-## 原生 API 依据
+- `TestCamer/CameraManager.swift`：相机配置、硬件对焦、快门参数、原生深度交付及中断处理。
+- `TestCamer/NativeDepthSnapshot.swift`、`CaptureModels.swift`：跨队列的不可变照片／深度值。
+- `TestCamer/DepthMath.swift`、`DepthCapturePolicy.swift`：方向、有效深度、清晰带、近远虚化量、虚拟光圈、结果检查。
+- `TestCamer/DepthBlurRenderer.swift`、`DepthPhotoProcessor.swift`：仅拍后的渲染与编码。
+- `TestCamer/ViewController.swift`、`DepthDiagnosticsViewController.swift`：原界面、结果对比和诊断。
+- `Tests/`、`Scripts/`：实际可复跑的本地与 Apple 平台检查，不参与 App 运行。
 
-以下是本次核对过的 Apple 官方接口，具体效果仍依赖设备、系统与场景。
-
-- [Capturing photos with depth](https://developer.apple.com/documentation/avfoundation/capturing-photos-with-depth)
-- [AVCapturePhotoOutput.isDepthDataDeliverySupported](https://developer.apple.com/documentation/avfoundation/avcapturephotooutput/isdepthdatadeliverysupported)
-- [AVCapturePhotoSettings.isDepthDataDeliveryEnabled](https://developer.apple.com/documentation/avfoundation/avcapturephotosettings/isdepthdatadeliveryenabled)
-- [AVDepthData](https://developer.apple.com/documentation/avfoundation/avdepthdata)
-- [CIImage.init(depthData:)](https://developer.apple.com/documentation/coreimage/ciimage/init(depthdata:))
-- [CIContext.depthBlurEffectFilter](https://developer.apple.com/documentation/coreimage/cicontext/depthblureffectfilter(for:disparityimage:portraiteffectsmatte:orientation:options:))
-
+实现细节、上一版问题的证据边界和真机步骤分别见 `Documentation/实现说明.md`、`Documentation/v2修订与验证.md`、`Documentation/真机验收.md`。

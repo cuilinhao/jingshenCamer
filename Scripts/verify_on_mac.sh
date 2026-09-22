@@ -9,9 +9,9 @@ fi
 command -v xcodebuild >/dev/null || { echo "未找到 xcodebuild" >&2; exit 2; }
 xcodebuild -version
 bash "$ROOT/Scripts/verify_local.sh"
-bash "$ROOT/Scripts/verify_depth_rendering.sh"
 BUILD_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/testcamer-xcodebuild.XXXXXX")"
 echo "构建产物与日志目录：$BUILD_ROOT"
 # 不签名的通用真机 SDK 构建，用来检查 iOS API、Swift 类型和资源编译。
 xcodebuild -project "$ROOT/TestCamer.xcodeproj" -scheme TestCamer   -configuration Debug -destination 'generic/platform=iOS'   -derivedDataPath "$BUILD_ROOT/DerivedData" CODE_SIGNING_ALLOWED=NO build   2>&1 | tee "$BUILD_ROOT/build.log"
-echo "SDK 构建完成。请继续用 Xcode 签名运行到真机，按 Documentation/真机验收.md 验证。"
+bash "$ROOT/Scripts/verify_render_on_mac.sh"
+echo "SDK 构建和合成图像渲染测试完成。请继续用 Xcode 签名运行到真机，按 Documentation/真机验收.md 验证。"

@@ -1,41 +1,47 @@
-//
-//  DepthPhotoProcessor.swift
-//  TestCamer
-//
-//  仅在快门拍摄完成后调用。纯 Swift + Apple 原生 Core Image / Image I/O。
-//  不做实时渲染，不用人像抠图冒充深度，不保存可重编辑的焦点/深度/Recipe。
-//
-
+// DepthPhotoProcessor.swift — v2
+// 只处理一次快门的照片，不参与普通取景。原图/深度/瞬时选焦只存在本次内存任务中。
 import Foundation
-@preconcurrency import AVFoundation
 import CoreImage
-import CoreVideo
+import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
+@preconcurrency import Vision
 
 struct ProcessedPhoto: Sendable {
-    /// 唯一允许保存到相册的文件：已经烘焙效果、移除辅助深度及相机私有元数据的普通 JPEG。
+    /// 只允许保存此完整分辨率 JPEG，不保存预览图、焦点、深度或 Recipe。
     let jpegData: Data
-    /// 仅供本次结果页显示；重拍即释放，不是可重编辑原片档案。
     let previewData: Data
     let originalPreviewData: Data
+    let diagnosticMaskData: Data?
+    /// 不含坐标、焦平面距离或人脸框，只含能力、质量和输出检查信息。
+    let diagnosticText: String
     let outcome: DepthRenderOutcome
     let aperture: Float
     let pixelWidth: Int
     let pixelHeight: Int
+    let captureID: Int64?
 }
 
-/// CIContext 和处理工作只在 renderQueue 上使用，不阻塞主线程。
+/// CIContext 与可变渲染状态仅由 renderQueue 使用。异步调用不阻塞相机/UI 主线程。
 final class DepthPhotoProcessor: @unchecked Sendable {
     private let renderQueue = DispatchQueue(label: "com.testcamer.photo-depth", qos: .userInitiated)
     private let context = CIContext(options: [.cacheIntermediates: false])
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
 
     func process(_ photo: CapturedPhoto) async throws -> ProcessedPhoto {
-        try await withCheckedThrowingContinuation { continuation in
+        let queued = ProcessInfo.processInfo.systemUptime
+        TestLog.shared.record("process queued bytes=\(photo.data.count) enabled=\(photo.options.enabled) " +
+            "depthRequested=\(photo.depthRequested) hasDepth=\(photo.hasDepthData) " +
+            "nativeDepth=\(photo.nativeDepth != nil) nativeMatte=\(photo.nativePortraitMatte != nil) " +
+            "tapGiven=\(photo.transientDeviceFocus != nil)", category: "processor", captureID: photo.captureID)
+        return try await withCheckedThrowingContinuation { continuation in
             renderQueue.async { [self] in
-                let result: Result<ProcessedPhoto, Error> = autoreleasepool {
-                    Result { try render(photo) }
+                TestLog.shared.record(String(format: "process started queueSeconds=%.3f",
+                    ProcessInfo.processInfo.systemUptime - queued), category: "processor", captureID: photo.captureID)
+                let result: Result<ProcessedPhoto, Error> = autoreleasepool { Result { try render(photo) } }
+                if case .failure(let error) = result {
+                    TestLog.shared.record("process failed \(TestLog.errorDescription(error))",
+                                          category: "processor", captureID: photo.captureID)
                 }
                 continuation.resume(with: result)
             }
@@ -46,241 +52,266 @@ final class DepthPhotoProcessor: @unchecked Sendable {
         dispatchPrecondition(condition: .onQueue(renderQueue))
         let started = Date()
         defer { context.clearCaches() }
+        var stage = "decode"
+        var stageStarted = ProcessInfo.processInfo.systemUptime
+        func log(_ event: String) {
+            TestLog.shared.record(event, category: "processor", captureID: photo.captureID)
+        }
+        func begin(_ name: String) {
+            stage = name
+            stageStarted = ProcessInfo.processInfo.systemUptime
+            log("stage start=\(name)")
+        }
+        func finish(_ details: String = "") {
+            log(String(format: "stage complete=%@ seconds=%.3f %@", stage,
+                       ProcessInfo.processInfo.systemUptime - stageStarted, details))
+        }
+        var completed = false
+        defer {
+            if !completed {
+                log(String(format: "process aborted stage=%@ stageSeconds=%.3f", stage,
+                           ProcessInfo.processInfo.systemUptime - stageStarted))
+            }
+        }
+        begin("decode")
         guard let source = CGImageSourceCreateWithData(photo.data as CFData, nil),
               let rawImage = CIImage(data: photo.data, options: [.applyOrientationProperty: false]) else {
+            log("stage failed=decode reason=image_source_or_ciimage_unavailable")
             throw CameraError.captureFailed
         }
         let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] ?? [:]
-        let orientationValue = (properties[kCGImagePropertyOrientation as String] as? NSNumber)?.uint32Value ?? 1
-        let orientation = CGImagePropertyOrientation(rawValue: orientationValue) ?? .up
-
-        // RGB 与深度都先应用同一个 EXIF 方向，然后给景深工厂传 .up，避免双重旋转。
-        // 不把低分辨率 depthMap 当作一张普通 sRGB 灰度图来重新归一化。
-        var uprightProperties = rawImage.properties
-        uprightProperties[kCGImagePropertyOrientation as String] = 1
-        let original = normalizedOrigin(rawImage.oriented(orientation)).settingProperties(uprightProperties)
-        guard !original.extent.isEmpty, !original.extent.isInfinite,
-              let originalCGImage = context.createCGImage(original, from: original.extent,
-                                                          format: .RGBA8, colorSpace: colorSpace) else {
+        let exif = (properties[kCGImagePropertyOrientation as String] as? NSNumber)?.uint32Value ?? 1
+        let orientation = CGImagePropertyOrientation(rawValue: exif) ?? .up
+        let original = normalizedOrigin(rawImage.oriented(orientation))
+            .settingProperties([kCGImagePropertyOrientation as String: 1])
+        guard !original.extent.isEmpty, !original.extent.isInfinite else {
+            log("stage failed=decode reason=invalid_image_extent")
             throw CameraError.captureFailed
         }
+        finish("raw=\(Int(rawImage.extent.width))x\(Int(rawImage.extent.height)) " +
+               "upright=\(Int(original.extent.width))x\(Int(original.extent.height)) exif=\(orientation.rawValue)")
+        var notes = ["TestCamer PostCaptureDepth v2", photo.captureSummary,
+                     "photoUpright=\(Int(original.extent.width))x\(Int(original.extent.height))",
+                     "exifApplied=\(orientation.rawValue)",
+                     String(format: "virtualAperture=f/%.1f", photo.options.aperture)]
+        var outcome: DepthRenderOutcome = .renderFailed
+        var outputCG: CGImage?
+        var diagnosticMaskData: Data?
 
-        var outcome: DepthRenderOutcome
-        var renderedCGImage: CGImage?
         if !photo.options.enabled {
             outcome = .disabled
+            log("depth bypass reason=option_disabled")
         } else if !photo.depthRequested {
             outcome = .unsupported
+            log("depth bypass reason=not_requested_or_unsupported")
         } else if !photo.hasDepthData {
             outcome = .missingDepth
-        } else if let capturedDepth = depthData(from: source) {
-            let disparityData = capturedDepth.applyingExifOrientation(orientation)
-                .converting(toDepthDataType: kCVPixelFormatType_DisparityFloat32)
-            if !hasUsableDepth(disparityData.depthDataMap) {
-                outcome = .invalidDepth
-            } else if let disparity = CIImage(depthData: disparityData),
-                      let filter = context.depthBlurEffectFilter(
-                        for: original,
-                        disparityImage: disparity,
-                        portraitEffectsMatte: portraitMatte(from: source, orientation: orientation),
-                        orientation: .up,
-                        options: nil),
-                      filter.inputKeys.contains("inputAperture"), filter.inputKeys.contains("inputFocusRect") {
-                // 工厂会准备原生景深需要的辅助信息；不要再 setDefaults() 把这些信息清空。
-                filter.setValue(NSNumber(value: photo.options.aperture), forKey: "inputAperture")
-                var focusSource = "system"
-                if let point = photo.options.focusPoint {
-                    // AVCapture 的对焦坐标以传感器左上为原点；Core Image 是左下。
-                    // 先转换到原始照片，再与 RGB/深度应用同一 EXIF 旋转/镜像。
-                    let sensorPoint = CGPoint(x: rawImage.extent.minX + point.x * rawImage.extent.width,
-                                              y: rawImage.extent.minY + (1 - point.y) * rawImage.extent.height)
-                    let uprightPoint = sensorPoint.applying(rawImage.orientationTransform(for: orientation))
-                    let orientedExtent = rawImage.oriented(orientation).extent
-                    let normalizedPoint = CGPoint(x: (uprightPoint.x - orientedExtent.minX) / orientedExtent.width,
-                                                  y: (uprightPoint.y - orientedExtent.minY) / orientedExtent.height)
-                    filter.setValue(CIVector(cgRect: focusRectangle(at: normalizedPoint)), forKey: "inputFocusRect")
-                    focusSource = "tap"
-                }
-                renderedCGImage = renderDepthFilter(filter, extent: original.extent)
-                var change = renderedCGImage.map { pixelDifference($0, originalCGImage) } ?? 0
-                // 非人脸、偏中心主体时，系统可能把背景选为清晰面，返回完全未变的图像。
-                // 只有自动选择无效才用本张真实视差寻找近景；不覆盖用户主动点选的背景。
-                if renderedCGImage != nil, change < 0.5, photo.options.focusPoint == nil,
-                   let rectangle = foregroundFocusRectangle(in: disparity) {
-                    filter.setValue(CIVector(cgRect: rectangle), forKey: "inputFocusRect")
-                    focusSource = "depth-foreground"
-                    renderedCGImage = renderDepthFilter(filter, extent: original.extent)
-                    change = renderedCGImage.map { pixelDifference($0, originalCGImage) } ?? 0
-                }
-                if renderedCGImage == nil {
-                    outcome = .renderFailed
-                } else if change < 0.5 {
-                    outcome = .noVisibleEffect
-                    renderedCGImage = nil
+            log("depth bypass reason=camera_did_not_deliver_depth")
+        } else if let nativeDepth = photo.nativeDepth {
+            do {
+                begin("depth_orientation_and_statistics")
+                // 同一套 EXIF 变换只应用一次，原图和视差宽高/旋转/镜像必须一致。
+                let depth = nativeDepth.raster.oriented(exif: orientation.rawValue)
+                notes += ["depthUpright=\(depth.width)x\(depth.height)",
+                          "depthQuality=\(nativeDepth.quality)", "depthAccuracy=\(nativeDepth.accuracy)",
+                          "depthFiltered=\(nativeDepth.filtered)", "depthSource=AVCapturePhoto.depthData (direct)"]
+                finish("size=\(depth.width)x\(depth.height) quality=\(nativeDepth.quality) " +
+                       "accuracy=\(nativeDepth.accuracy) filtered=\(nativeDepth.filtered) " + depthStatistics(depth))
+                begin("subject_selection")
+                let uprightTap = photo.transientDeviceFocus?.oriented(exif: orientation.rawValue)
+                let subject = PortraitSubjectMask(context: context).select(in: original,
+                    nativeMatte: photo.nativePortraitMatte, exif: orientation.rawValue, tap: uprightTap,
+                    captureID: photo.captureID)
+                let selection: (point: NormalizedImagePoint?, isPerson: Bool, source: String)
+                if let subject {
+                    selection = (subject.focusPoint, true, subject.source)
                 } else {
-                    outcome = .applied
+                    selection = choosePlane(original: original, depth: depth,
+                        transientDeviceFocus: photo.transientDeviceFocus, exif: orientation.rawValue,
+                        captureID: photo.captureID)
                 }
-                print(String(format: "[Depth] native focus=%@, virtual f/%.1f, pixelChange=%.3f/255 (linear RGB)",
-                             focusSource, photo.options.aperture, change))
-            } else {
+                notes.append("selection=\(selection.source)") // 不记录点位或人脸框。
+                finish("source=\(selection.source) isPerson=\(selection.isPerson) protectedSubject=\(subject != nil)")
+                begin("depth_plan")
+                let plan = try DepthMath.makePlan(depth: depth, focus: selection.point,
+                                                 isPerson: selection.isPerson, aperture: photo.options.aperture)
+                notes.append(String(format: "validDepth=%.1f%%", plan.validFraction*100))
+                finish(String(format: "validDepth=%.2f%% nearCoverage=%.2f%% farCoverage=%.2f%%",
+                              plan.validFraction * 100, plan.nearFraction * 100, plan.farFraction * 100))
+                begin("render_graph")
+                let renderer = DepthBlurRenderer(context: context, colorSpace: colorSpace)
+                let result = try renderer.render(original: original, plan: plan, protectedSubject: subject?.mask)
+                notes.append(result.notes)
+                finish(result.notes)
+                begin("materialize_output")
+                guard let cg = context.createCGImage(result.image, from: original.extent,
+                                                      format: .RGBA8, colorSpace: colorSpace) else {
+                    throw DepthRendererError.imageCreation
+                }
+                outputCG = cg
+                finish("size=\(cg.width)x\(cg.height)")
+                begin("measure_output")
+                // 检查最终输出像素，不再把“滤镜返回了对象”当成“明显虚化”。
+                let measurement: EffectMeasurement = try measure(original: original,
+                    result: CIImage(cgImage: cg), mask: result.amountMask)
+                notes += [String(format: "eligiblePixels=%d\nmeanChange=%.3f/255\nchangedPixels=%.1f%%",
+                                 measurement.eligiblePixelCount, measurement.meanAbsoluteChange*255,
+                                 measurement.changedFraction*100),
+                          "measurement=output difference only; not a visual quality guarantee"]
+                outcome = measurement.hasVisibleChange ? .applied : .weakEffect
+                finish(String(format: "eligiblePixels=%d meanChange=%.4f/255 changedPixels=%.2f%% outcome=%@",
+                    measurement.eligiblePixelCount, measurement.meanAbsoluteChange * 255,
+                    measurement.changedFraction * 100, outcome.rawValue))
+                begin("diagnostic_preview")
+                diagnosticMaskData = try? previewJPEG(result.amountMask, maximum: 1200)
+                finish("available=\(diagnosticMaskData != nil) bytes=\(diagnosticMaskData?.count ?? 0)")
+            } catch let error as DepthAnalysisError {
+                log("stage failed=\(stage) \(TestLog.errorDescription(error))")
+                notes.append("analysisIssue=\(error.localizedDescription)")
+                switch error {
+                case .insufficientSeparation: outcome = .insufficientSeparation
+                case .focusUnavailable: outcome = .focusUnavailable
+                case .alignmentMismatch: outcome = .alignmentMismatch
+                default: outcome = .invalidDepth
+                }
+                outputCG = nil
+            } catch {
+                log("stage failed=\(stage) \(TestLog.errorDescription(error))")
+                notes.append("renderIssue=\(error.localizedDescription)")
                 outcome = .renderFailed
+                outputCG = nil
             }
         } else {
-            outcome = .missingDepth
+            // 已交付深度但无法复制时应报无效深度，而不是误称设备不支持。
+            outcome = .invalidDepth
+            log("depth bypass reason=delivered_depth_snapshot_missing")
         }
 
-        // 所有缺深度/无效深度/滤镜失败路径都保留普通照片，明确标注 fallback。
-        // 不悄悄改成全图模糊，也不伪造一次“景深成功”。
-        if renderedCGImage == nil {
-            print("[Depth] fallback: \(outcome.rawValue)")
-            renderedCGImage = originalCGImage
+        if outputCG == nil {
+            begin("ordinary_photo_fallback")
+            notes.append("fallback=ordinary photo; no synthetic/AI/full-frame blur")
+            outputCG = context.createCGImage(original, from: original.extent, format: .RGBA8, colorSpace: colorSpace)
+            finish("reason=\(outcome.rawValue) imageAvailable=\(outputCG != nil)")
         }
-        guard let cgImage = renderedCGImage else { throw CameraError.captureFailed }
-        let jpeg = try encodeJPEG(cgImage, quality: 0.95)
-        let preview = try previewJPEG(CIImage(cgImage: cgImage))
-        let before = outcome.isDepthApplied ? try previewJPEG(original) : preview
-        let elapsed = Date().timeIntervalSince(started)
-        print(String(format: "[Depth] outcome=%@, image=%dx%d, elapsed=%.2fs, JPEG=%d bytes",
-                     outcome.rawValue, cgImage.width, cgImage.height, elapsed, jpeg.count))
+        guard let image = outputCG else {
+            log("output failed reason=no_rendered_or_fallback_image")
+            throw CameraError.captureFailed
+        }
+        begin("encode_jpeg")
+        let jpeg = try encodeJPEG(image, quality: 0.95)
+        finish("bytes=\(jpeg.count)")
+        begin("output_preview")
+        let preview = try previewJPEG(CIImage(cgImage: image))
+        finish("bytes=\(preview.count)")
+        begin("original_preview")
+        let before = outcome.canCompare ? try previewJPEG(original) : preview
+        finish("canCompare=\(outcome.canCompare) bytes=\(before.count)")
+        notes += ["outcome=\(outcome.rawValue)", String(format: "processingSeconds=%.2f", Date().timeIntervalSince(started)),
+                  "jpegSize=\(jpeg.count) bytes", "savedFocusMetadata=false", "savedDepthMetadata=false"]
+        let diagnosticText = notes.joined(separator: "\n")
+        print("[Depth v2]\n\(diagnosticText)")
+        log("process complete outcome=\(outcome.rawValue)\n\(diagnosticText)")
+        completed = true
         return ProcessedPhoto(jpegData: jpeg, previewData: preview, originalPreviewData: before,
+                              diagnosticMaskData: diagnosticMaskData, diagnosticText: diagnosticText,
                               outcome: outcome, aperture: photo.options.aperture,
-                              pixelWidth: cgImage.width, pixelHeight: cgImage.height)
+                              pixelWidth: image.width, pixelHeight: image.height, captureID: photo.captureID)
     }
 
-    private func renderDepthFilter(_ filter: CIFilter, extent: CGRect) -> CGImage? {
-        guard let image = filter.outputImage else { return nil }
-        return context.createCGImage(image.cropped(to: extent), from: extent, format: .RGBA8, colorSpace: colorSpace)
-    }
-
-    private func focusRectangle(at point: CGPoint) -> CGRect {
-        let side: CGFloat = 0.06
-        return CGRect(x: min(max(point.x - side / 2, 0), 1 - side),
-                      y: min(max(point.y - side / 2, 0), 1 - side), width: side, height: side)
-    }
-
-    /// 在真实视差上寻找连续的近景小区域。3×3 的最小值可排除孤立的异常高值，
-    /// 相同深度优先靠近画面中心；采样只用于选焦点，不改滤镜收到的原始视差。
-    private func foregroundFocusRectangle(in disparity: CIImage) -> CGRect? {
-        let size = 48
-        let small = normalizedOrigin(disparity).transformed(by: CGAffineTransform(
-            scaleX: CGFloat(size) / disparity.extent.width, y: CGFloat(size) / disparity.extent.height))
-        var samples = [Float](repeating: 0, count: size * size)
-        context.render(small, toBitmap: &samples, rowBytes: size * MemoryLayout<Float>.stride,
-                       bounds: CGRect(x: 0, y: 0, width: size, height: size), format: .Rf, colorSpace: nil)
-        var bestDepth: Float = 0
-        var bestDistance = CGFloat.infinity
-        var bestPoint: CGPoint?
-        for y in 2..<(size - 2) {
-            for x in 2..<(size - 2) {
-                var nearestPlane = Float.infinity
-                for dy in -1...1 {
-                    for dx in -1...1 {
-                        let value = samples[(y + dy) * size + x + dx]
-                        nearestPlane = value.isFinite && value > 0 ? min(nearestPlane, value) : 0
-                    }
-                }
-                let point = CGPoint(x: (CGFloat(x) + 0.5) / CGFloat(size),
-                                    y: 1 - (CGFloat(y) + 0.5) / CGFloat(size))
-                let distance = pow(point.x - 0.5, 2) + pow(point.y - 0.5, 2)
-                if nearestPlane > bestDepth || (nearestPlane == bestDepth && distance < bestDistance) {
-                    bestDepth = nearestPlane
-                    bestDistance = distance
-                    bestPoint = point
-                }
-            }
+    /// 点按优先；未点按时，用人脸中心的深度或画面中心深度。Vision 只检测框，不做人像替换。
+    /// 点位只在当前调用链传递，不进入 ProcessedPhoto、照片 EXIF、JSON 或磁盘。
+    private func choosePlane(original: CIImage, depth: DepthRaster,
+                             transientDeviceFocus: NormalizedImagePoint?, exif: UInt32, captureID: Int64?)
+        -> (point: NormalizedImagePoint?, isPerson: Bool, source: String) {
+        let faceCenters = detectFaceCenters(original, captureID: captureID)
+        if let devicePoint = transientDeviceFocus {
+            let point = devicePoint.oriented(exif: exif)
+            // 人物关联由同帧人物 mask 判定；相对视差值的比例不能判断是否同一个人。
+            return (point, false, "本次点按（处理后不保留）")
         }
-        guard bestDepth > 0, let point = bestPoint else { return nil }
-        return focusRectangle(at: point)
-    }
-
-    /// 在原分辨率先求差再规约。先缩图会把细纹理的虚化差异抹掉，误丢弃有效成片。
-    private func pixelDifference(_ result: CGImage, _ original: CGImage) -> Double {
-        let before = CIImage(cgImage: original)
-        let difference = CIImage(cgImage: result).applyingFilter("CIDifferenceBlendMode", parameters: [
-            kCIInputBackgroundImageKey: before
-        ])
-        let average = difference.applyingFilter("CIAreaAverage", parameters: [
-            kCIInputExtentKey: CIVector(cgRect: before.extent)
-        ])
-        var pixel = [Float](repeating: 0, count: 4)
-        // 不对差值做 sRGB 编码；读取同一工作空间下的线性 RGB 平均差。
-        context.render(average, toBitmap: &pixel, rowBytes: 4 * MemoryLayout<Float>.stride,
-                       bounds: CGRect(x: 0, y: 0, width: 1, height: 1), format: .RGBAf, colorSpace: nil)
-        return Double(pixel[0] + pixel[1] + pixel[2]) / 3 * 255
-    }
-
-    private func depthData(from source: CGImageSource) -> AVDepthData? {
-        // 同一次拍照的内存文件中读取，绝不混用另一帧的实时深度。
-        for type in [kCGImageAuxiliaryDataTypeDisparity, kCGImageAuxiliaryDataTypeDepth] {
-            if let dictionary = CGImageSourceCopyAuxiliaryDataInfoAtIndex(source, 0, type) as? [AnyHashable: Any],
-               let depth = try? AVDepthData(fromDictionaryRepresentation: dictionary) {
-                return depth
-            }
+        if let face = faceCenters.first(where: { depth.value(at: $0) != nil }) {
+            return (face, true, "自动人脸深度平面")
         }
-        return nil
+        return (nil, false, "自动中心深度平面；非居中物体请在拍前点选")
     }
 
-    private func portraitMatte(from source: CGImageSource, orientation: CGImagePropertyOrientation) -> CIImage? {
-        // 人像时可选的边缘辅助；杯子/植物场景没有 matte 也照常使用真实深度。
-        guard let info = CGImageSourceCopyAuxiliaryDataInfoAtIndex(source, 0,
-                  kCGImageAuxiliaryDataTypePortraitEffectsMatte) as? [AnyHashable: Any],
-              let matte = try? AVPortraitEffectsMatte(fromDictionaryRepresentation: info) else { return nil }
-        return CIImage(cvPixelBuffer: matte.applyingExifOrientation(orientation).mattingImage)
-    }
-
-    private func hasUsableDepth(_ map: CVPixelBuffer) -> Bool {
-        guard CVPixelBufferGetPixelFormatType(map) == kCVPixelFormatType_DisparityFloat32,
-              CVPixelBufferLockBaseAddress(map, .readOnly) == kCVReturnSuccess else { return false }
-        defer { CVPixelBufferUnlockBaseAddress(map, .readOnly) }
-        guard let base = CVPixelBufferGetBaseAddress(map) else { return false }
-        let width = CVPixelBufferGetWidth(map)
-        let height = CVPixelBufferGetHeight(map)
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(map)
-        var total = 0
-        var valid = 0
-        var minimum = Float.infinity
-        var maximum = -Float.infinity
-        for y in stride(from: 0, to: height, by: max(1, height / 64)) {
-            let row = base.advanced(by: y * bytesPerRow).assumingMemoryBound(to: Float.self)
-            for x in stride(from: 0, to: width, by: max(1, width / 64)) {
-                total += 1
-                let value = row[x]
-                if value.isFinite && value > 0 {
-                    valid += 1
-                    minimum = min(minimum, value)
-                    maximum = max(maximum, value)
-                }
-            }
+    private func detectFaceCenters(_ original: CIImage, captureID: Int64?) -> [NormalizedImagePoint] {
+        // 限制检测图尺寸，避免为选一个点处理整张 12 MP 图像。
+        let scale = min(1, 960/max(original.extent.width, original.extent.height))
+        let small = original.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let request = VNDetectFaceRectanglesRequest()
+        let started = ProcessInfo.processInfo.systemUptime
+        TestLog.shared.record("fallback face detection start", category: "processor", captureID: captureID)
+        do {
+            try VNImageRequestHandler(ciImage: small, orientation: .up, options: [:]).perform([request])
+            TestLog.shared.record(String(format: "fallback face detection complete count=%d accepted=%d seconds=%.3f",
+                request.results?.count ?? 0, (request.results ?? []).filter { $0.confidence >= 0.4 }.count,
+                ProcessInfo.processInfo.systemUptime - started), category: "processor", captureID: captureID)
+            return (request.results ?? []).filter { $0.confidence >= 0.4 }
+                .sorted { $0.boundingBox.width*$0.boundingBox.height > $1.boundingBox.width*$1.boundingBox.height }
+                .map { NormalizedImagePoint(x: Double($0.boundingBox.midX), y: Double(1-$0.boundingBox.midY)) }
+        } catch {
+            print("[Depth v2] face detection unavailable; native depth still required")
+            TestLog.shared.record("fallback face detection failed \(TestLog.errorDescription(error))",
+                                  category: "processor", captureID: captureID)
+            return []
         }
-        print("[Depth] disparity=\(width)x\(height), valid=\(valid)/\(total), range=\(minimum)...\(maximum)")
-        return DepthCapturePolicy.usableDepth(valid: valid, total: total, minimum: minimum, maximum: maximum)
+    }
+
+    /// 只写分布聚合数值，不记录像素、焦点深度、坐标或人脸框。
+    private func depthStatistics(_ depth: DepthRaster) -> String {
+        let valid = depth.values.filter { $0.isFinite && $0 > 0 }.sorted()
+        guard let minimum = valid.first, let maximum = valid.last else {
+            return "validDepth=0% samples=\(depth.values.count)"
+        }
+        func q(_ fraction: Double) -> Float { valid[Int(Double(valid.count - 1) * fraction)] }
+        return String(format: "validDepth=%.2f%% samples=%d min=%.6f q02=%.6f q50=%.6f q98=%.6f max=%.6f robustSpan=%.6f",
+            Double(valid.count) / Double(depth.values.count) * 100, depth.values.count,
+            minimum, q(0.02), q(0.5), q(0.98), maximum, q(0.98) - q(0.02))
+    }
+
+    private func measure(original: CIImage, result: CIImage, mask: CIImage) throws -> EffectMeasurement {
+        let long = max(original.extent.width, original.extent.height)
+        let w = max(1, Int((original.extent.width/long*640).rounded()))
+        let h = max(1, Int((original.extent.height/long*640).rounded()))
+        let before = bitmap(original, width: w, height: h, colorSpace: colorSpace)
+        let after = bitmap(result, width: w, height: h, colorSpace: colorSpace)
+        let maskRGBA = bitmap(mask, width: w, height: h, colorSpace: nil)
+        let amount = stride(from: 0, to: maskRGBA.count, by: 4).map { maskRGBA[$0] }
+        return try EffectMeasurement(originalRGBA: before, renderedRGBA: after, mask: amount)
+    }
+
+    private func bitmap(_ image: CIImage, width: Int, height: Int, colorSpace: CGColorSpace?) -> [UInt8] {
+        let resized = normalizedOrigin(image).transformed(by:
+            CGAffineTransform(scaleX: CGFloat(width)/image.extent.width, y: CGFloat(height)/image.extent.height))
+        var data = [UInt8](repeating: 0, count: width*height*4)
+        data.withUnsafeMutableBytes { buffer in
+            guard let base = buffer.baseAddress else { return }
+            context.render(resized, toBitmap: base, rowBytes: width*4,
+                           bounds: CGRect(x: 0, y: 0, width: width, height: height),
+                           format: .RGBA8, colorSpace: colorSpace)
+        }
+        return data
     }
 
     private func normalizedOrigin(_ image: CIImage) -> CIImage {
         image.transformed(by: CGAffineTransform(translationX: -image.extent.minX, y: -image.extent.minY))
     }
-
-    private func previewJPEG(_ image: CIImage) throws -> Data {
-        let scale = min(1, 1600 / max(image.extent.width, image.extent.height))
+    private func previewJPEG(_ image: CIImage, maximum: CGFloat = 1600) throws -> Data {
+        let scale = min(1, maximum/max(image.extent.width, image.extent.height))
         let small = normalizedOrigin(image.transformed(by: CGAffineTransform(scaleX: scale, y: scale)))
-        guard let cgImage = context.createCGImage(small, from: small.extent.integral,
-                                                 format: .RGBA8, colorSpace: colorSpace) else {
+        guard let cg = context.createCGImage(small, from: small.extent.integral, format: .RGBA8, colorSpace: colorSpace) else {
             throw CameraError.captureFailed
         }
-        return try encodeJPEG(cgImage, quality: 0.9)
+        return try encodeJPEG(cg, quality: 0.9)
     }
-
     private func encodeJPEG(_ image: CGImage, quality: Double) throws -> Data {
         let data = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(data as CFMutableData, UTType.jpeg.identifier as CFString, 1, nil) else {
-            throw CameraError.captureFailed
-        }
-        // 明确白名单：方向 + JPEG 质量。绝不拷贝相机 MakerApple、焦点、辅助深度或 Recipe。
-        // 虚拟 f 值也不会伪装成真实镜头光圈写入 EXIF。
-        let properties: [CFString: Any] = [
-            kCGImageDestinationLossyCompressionQuality: quality,
-            kCGImagePropertyOrientation: 1
-        ]
+        guard let destination = CGImageDestinationCreateWithData(data as CFMutableData,
+            UTType.jpeg.identifier as CFString, 1, nil) else { throw CameraError.captureFailed }
+        // 白名单，不复制 MakerApple / 焦点 / 辅助深度。不将虚拟 f 值伪装成物理光圈。
+        let properties: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: quality,
+                                         kCGImagePropertyOrientation: 1]
         CGImageDestinationAddImage(destination, image, properties as CFDictionary)
         guard CGImageDestinationFinalize(destination) else { throw CameraError.captureFailed }
         return data as Data

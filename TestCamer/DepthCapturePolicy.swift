@@ -3,50 +3,47 @@
 //  TestCamer
 //
 //  拍后景深的纯值规则，可脱离 iOS 相机运行回归测试。
-//  对焦点只作为本次快门的内存参数，不写入成片或可重编辑档案。
+//  不包含、也不持久化聚焦坐标。
 //
 import Foundation
-#if canImport(CoreGraphics)
-import CoreGraphics
-#endif
 
 struct DepthOptions: Sendable, Equatable {
     let enabled: Bool
     let aperture: Float
-    /// 传感器归一化坐标（左上为原点）；nil 表示使用自动景深选择。
-    let focusPoint: CGPoint?
 
-    init(enabled: Bool, aperture: Float, focusPoint: CGPoint? = nil) {
+    init(enabled: Bool, aperture: Float) {
         self.enabled = enabled
         self.aperture = aperture.isFinite ? min(max(aperture, 1.4), 16) : 1.8
-        if let point = focusPoint, point.x.isFinite, point.y.isFinite {
-            self.focusPoint = CGPoint(x: min(max(point.x, 0), 1), y: min(max(point.y, 0), 1))
-        } else {
-            self.focusPoint = nil
-        }
     }
 }
 
 enum DepthRenderOutcome: String, Sendable {
     case applied
+    case weakEffect
     case disabled
     case unsupported
     case missingDepth
     case invalidDepth
     case renderFailed
-    case noVisibleEffect
+    case insufficientSeparation
+    case focusUnavailable
+    case alignmentMismatch
 
     var isDepthApplied: Bool { self == .applied }
+    var canCompare: Bool { self == .applied || self == .weakEffect }
 
     var message: String {
         switch self {
-        case .applied: return "景深成片"
+        case .applied: return "景深成片 · 已检测到图像变化"
+        case .weakEffect: return "已处理 · 本次可见变化较弱，请查看诊断"
         case .disabled: return "普通照片 · 景深已关闭"
         case .unsupported: return "普通照片 · 当前相机不支持原生深度"
         case .missingDepth: return "普通照片 · 本次未获得深度数据"
         case .invalidDepth: return "普通照片 · 深度无效或场景层次不足"
         case .renderFailed: return "普通照片 · 本次景深处理未成功"
-        case .noVisibleEffect: return "普通照片 · 本次景深变化不明显，可点按近处主体或调大光圈"
+        case .insufficientSeparation: return "普通照片 · 前后深度差不足"
+        case .focusUnavailable: return "普通照片 · 所选区域缺少有效深度"
+        case .alignmentMismatch: return "普通照片 · 深度与照片比例不一致"
         }
     }
 }

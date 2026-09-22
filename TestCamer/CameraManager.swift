@@ -9,7 +9,6 @@
 import Foundation
 @preconcurrency import AVFoundation
 
-// 工程不再默认把所有类型隔离到 MainActor；相机可变状态只在 sessionQueue 访问。
 /// 传给 UI 的不可变快照。UI 不再直接跨线程读取 deviceInput / zoomFactor。
 struct CameraState: Sendable {
     let isFront: Bool
@@ -37,7 +36,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
     private var position: AVCaptureDevice.Position = .back
     private var isConfigured = false
     private var wantsToRun = false
-    private var depthFocusPoint: CGPoint?
+    private var userDidTapFocus = false
     private var eventHandler: (@Sendable (CameraEvent) -> Void)?
     private var observers: [NSObjectProtocol] = []
 
@@ -45,14 +44,17 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
         let id: Int64
         let options: DepthOptions
         let depthRequested: Bool
+        let transientDeviceFocus: NormalizedImagePoint?
         let continuation: CheckedContinuation<CapturedPhoto, Error>
         var result: Result<CapturedPhoto, Error>?
 
         init(id: Int64, options: DepthOptions, depthRequested: Bool,
+             transientDeviceFocus: NormalizedImagePoint?,
              continuation: CheckedContinuation<CapturedPhoto, Error>) {
             self.id = id
             self.options = options
             self.depthRequested = depthRequested
+            self.transientDeviceFocus = transientDeviceFocus
             self.continuation = continuation
         }
     }
@@ -72,9 +74,14 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
     }
 
     func requestAccess() async -> Bool {
-        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        let authorization = AVCaptureDevice.authorizationStatus(for: .video)
+        TestLog.shared.record("camera permission status=\(authorization.rawValue)", category: "camera")
+        switch authorization {
         case .authorized: return true
-        case .notDetermined: return await AVCaptureDevice.requestAccess(for: .video)
+        case .notDetermined:
+            let granted = await AVCaptureDevice.requestAccess(for: .video)
+            TestLog.shared.record("camera permission granted=\(granted)", category: "camera")
+            return granted
         default: return false
         }
     }
@@ -97,15 +104,16 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
             guard !session.isInterrupted else { throw CameraError.interrupted }
             if !session.isRunning { session.startRunning() }
             guard session.isRunning else { throw CameraError.unavailable }
-            print("[Camera] running, device=\(deviceInput?.device.localizedName ?? "unknown")")
+            TestLog.shared.record("[Camera] running, device=\(deviceInput?.device.localizedName ?? "unknown")")
             return makeState()
         }
     }
 
     func stop() {
         sessionQueue.async { [self] in
+            TestLog.shared.record("session stop requested running=\(session.isRunning)", category: "camera")
             wantsToRun = false
-            depthFocusPoint = nil
+            userDidTapFocus = false
             if let pending = pendingCapture {
                 finishCapture(id: pending.id, result: .failure(CameraError.interrupted))
             }
@@ -120,6 +128,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
     func switchCamera() async throws -> CameraState {
         try await onSessionQueue { [self] in
             guard pendingCapture == nil else { throw CameraError.busy }
+            TestLog.shared.record("switch camera requested", category: "camera")
             let previous = position
             let next: AVCaptureDevice.Position = previous == .back ? .front : .back
             let restart = wantsToRun
@@ -128,7 +137,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
                 try configureSession(for: next)
             } catch {
                 // 不能因为切换失败把原来的输入永远移除，留下黑屏。
-                print("[Camera] switch failed: \(error); restoring previous input")
+                TestLog.shared.record("[Camera] switch failed: \(error); restoring previous input")
                 try? configureSession(for: previous)
                 if restart && isConfigured { session.startRunning() }
                 throw error
@@ -145,17 +154,18 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
             do {
                 try device.lockForConfiguration()
                 defer { device.unlockForConfiguration() }
+                userDidTapFocus = false // 变焦改变构图，旧点按不再用于下一张的算法选焦。
                 device.videoZoomFactor = CGFloat(DepthCapturePolicy.clampedZoom(
                     Double(factor), minimum: Double(device.minAvailableVideoZoomFactor),
                     maximum: Double(device.maxAvailableVideoZoomFactor)))
                 eventHandler?(.ready(makeState()))
             } catch {
-                print("[Camera] zoom rejected: \(error.localizedDescription)")
+                TestLog.shared.record("[Camera] zoom rejected: \(error.localizedDescription)")
             }
         }
     }
 
-    /// 点按同时指定下一张照片的景深清晰区域；只在内存中传递，不写入照片或日志。
+    /// 保留硬件点按。只记一个“本轮有点按”布尔值，快门时从设备读取点位；不落盘、不输出坐标。
     func focus(at point: CGPoint) {
         sessionQueue.async { [self] in
             guard pendingCapture == nil, let device = deviceInput?.device else { return }
@@ -165,16 +175,16 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
                 if device.isFocusPointOfInterestSupported && device.isFocusModeSupported(.autoFocus) {
                     device.focusPointOfInterest = point
                     device.focusMode = .autoFocus
+                    userDidTapFocus = true
                 }
                 if device.isExposurePointOfInterestSupported && device.isExposureModeSupported(.autoExpose) {
                     device.exposurePointOfInterest = point
                     device.exposureMode = .autoExpose
                 }
                 device.isSubjectAreaChangeMonitoringEnabled = true
-                depthFocusPoint = point
-                print("[Camera] hardware autofocus and next-photo depth focus requested")
+                TestLog.shared.record("[Camera] hardware autofocus requested; no focus record created")
             } catch {
-                print("[Camera] focus rejected: \(error.localizedDescription)")
+                TestLog.shared.record("[Camera] focus rejected: \(error.localizedDescription)")
             }
         }
     }
@@ -184,11 +194,13 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
         try await withCheckedThrowingContinuation { continuation in
             sessionQueue.async { [self] in
                 guard pendingCapture == nil else {
+                    TestLog.shared.record("capture rejected: busy", category: "capture")
                     continuation.resume(throwing: CameraError.busy)
                     return
                 }
                 guard session.isRunning, !session.isInterrupted,
                       let connection = photoOutput.connection(with: .video) else {
+                    TestLog.shared.record("capture rejected: session running=\(session.isRunning), interrupted=\(session.isInterrupted)", category: "capture")
                     continuation.resume(throwing: CameraError.unavailable)
                     return
                 }
@@ -216,23 +228,29 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
                     && photoOutput.isDepthDataDeliveryEnabled
                 settings.isDepthDataDeliveryEnabled = useDepth
                 settings.isDepthDataFiltered = true
-                settings.embedsDepthDataInPhoto = useDepth
+                settings.embedsDepthDataInPhoto = false // 直接传 photo.depthData，不依赖编码容器附件。
                 settings.isPortraitEffectsMatteDeliveryEnabled = useDepth
+                    && photoOutput.isPortraitEffectsMatteDeliverySupported
                     && photoOutput.isPortraitEffectsMatteDeliveryEnabled
-                settings.embedsPortraitEffectsMatteInPhoto = settings.isPortraitEffectsMatteDeliveryEnabled
+                settings.embedsPortraitEffectsMatteInPhoto = false
 
+                let transientFocus: NormalizedImagePoint?
+                if userDidTapFocus, let point = deviceInput?.device.focusPointOfInterest {
+                    transientFocus = NormalizedImagePoint(x: Double(point.x), y: Double(point.y))
+                } else { transientFocus = nil }
+                userDidTapFocus = false // 此选择只消费一次；不作为可重编辑照片参数保留。
                 let id = settings.uniqueID
-                let frozenOptions = DepthOptions(enabled: options.enabled, aperture: options.aperture,
-                                                 focusPoint: depthFocusPoint)
-                depthFocusPoint = nil
-                pendingCapture = PendingCapture(id: id, options: frozenOptions, depthRequested: useDepth,
+                pendingCapture = PendingCapture(id: id, options: options, depthRequested: useDepth, transientDeviceFocus: transientFocus,
                                                 continuation: continuation)
-                print("[Capture \(id)] depthRequested=\(useDepth), virtual f/\(options.aperture), angle=\(rotationAngle)")
+                TestLog.shared.record("begin enabled=\(options.enabled), depthRequested=\(useDepth), nativeMatteRequested=\(settings.isPortraitEffectsMatteDeliveryEnabled), aperture=\(options.aperture), angle=\(rotationAngle), mirrored=\(mirrored), codec=\(codec.rawValue), flash=\(settings.flashMode.rawValue), tapFocus=\(transientFocus != nil)", category: "capture", captureID: id)
+                if let device = deviceInput?.device {
+                    TestLog.shared.record("deviceType=\(device.deviceType.rawValue), position=\(device.position.rawValue), zoom=\(device.videoZoomFactor), focusMode=\(device.focusMode.rawValue), adjustingFocus=\(device.isAdjustingFocus), adjustingExposure=\(device.isAdjustingExposure), ISO=\(device.iso), exposureSeconds=\(device.exposureDuration.seconds)", category: "capture", captureID: id)
+                }
                 photoOutput.capturePhoto(with: settings, delegate: self)
 
                 sessionQueue.asyncAfter(deadline: .now() + DepthCapturePolicy.captureTimeout) { [weak self] in
                     guard let self, self.pendingCapture?.id == id else { return }
-                    print("[Capture \(id)] timed out; restarting capture session")
+                    TestLog.shared.record("timed out after \(DepthCapturePolicy.captureTimeout)s; restarting capture session", category: "capture", captureID: id)
                     // 迟到回调由 uniqueID 丢弃；重启在同一队列，下一次请求不会插入重启中间。
                     if self.session.isRunning { self.session.stopRunning() }
                     self.finishCapture(id: id, result: .failure(CameraError.captureTimedOut))
@@ -248,16 +266,42 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto,
                      error: Error?) {
         let id = photo.resolvedSettings.uniqueID
+        TestLog.shared.record("processing callback error=\(error.map(TestLog.errorDescription) ?? "none")", category: "capture", captureID: id)
         let hasDepth = photo.depthData != nil
         let data = error == nil ? photo.fileDataRepresentation() : nil
+        // 关键修订：把“本张照片的深度值”交给渲染器，而不是只交一个 hasDepth 布尔值。
+        var snapshot: NativeDepthSnapshot?
+        var depthIssue: String?
+        if error == nil, let depth = photo.depthData {
+            do { snapshot = try NativeDepthSnapshot(depthData: depth) }
+            catch { depthIssue = error.localizedDescription }
+        }
+        let frozenSnapshot = snapshot
+        let frozenIssue = depthIssue
+        // 同帧遮罩复制为值后跨队列传递；不把 CVPixelBuffer 或选区保存进成片。
+        let frozenMatte = error == nil ? photo.portraitEffectsMatte.flatMap { matte -> NativePortraitMatteSnapshot? in
+            do { return try NativePortraitMatteSnapshot(portraitEffectsMatte: matte) }
+            catch {
+                TestLog.shared.record("native matte copy failed: \(TestLog.errorDescription(error))", category: "capture", captureID: id)
+                return nil
+            }
+        } : nil
+        TestLog.shared.record("delivered bytes=\(data?.count ?? 0), depth=\(hasDepth), copiedDepth=\(frozenSnapshot != nil), depthCopyError=\(frozenIssue ?? "none"), matteDelivered=\(photo.portraitEffectsMatte != nil), matteCopied=\(frozenMatte != nil)", category: "capture", captureID: id)
+        let sourceType = photo.sourceDeviceType?.rawValue ?? "unknown"
         sessionQueue.async { [self] in
             guard let pending = pendingCapture, pending.id == id else { return }
             if let error {
                 pending.result = .failure(error)
             } else if let data {
-                print("[Capture \(id)] photoBytes=\(data.count), deliveredDepth=\(hasDepth)")
+                let summary = "captureID=\(id)\nsource=\(sourceType)\nrequestedDepth=\(pending.depthRequested)" +
+                    "\ndeliveredDepth=\(hasDepth)\ndirectDepthCopy=\(frozenSnapshot != nil)" +
+                    "\ndepthCopyIssue=\(frozenIssue ?? "none")" +
+                    "\nnativePortraitMatte=\(frozenMatte != nil)"
+                TestLog.shared.record("[Capture \(id)] photoBytes=\(data.count), depth=\(hasDepth), directCopy=\(frozenSnapshot != nil)")
                 pending.result = .success(CapturedPhoto(data: data, depthRequested: pending.depthRequested,
-                                                        hasDepthData: hasDepth, options: pending.options))
+                    hasDepthData: hasDepth, nativeDepth: frozenSnapshot, options: pending.options,
+                    transientDeviceFocus: pending.transientDeviceFocus, captureSummary: summary,
+                    nativePortraitMatte: frozenMatte, captureID: id))
             } else {
                 pending.result = .failure(CameraError.captureFailed)
             }
@@ -269,6 +313,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
                      error: Error?) {
         sessionQueue.async { [self] in
             let id = resolvedSettings.uniqueID
+            TestLog.shared.record("terminal callback error=\(error.map(TestLog.errorDescription) ?? "none")", category: "capture", captureID: id)
             guard let pending = pendingCapture, pending.id == id else { return }
             if let error {
                 finishCapture(id: id, result: .failure(error))
@@ -284,15 +329,18 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
         try await withCheckedThrowingContinuation { continuation in
             sessionQueue.async {
                 do { continuation.resume(returning: try work()) }
-                catch { continuation.resume(throwing: error) }
+                catch {
+                    TestLog.shared.record("session operation failed: \(TestLog.errorDescription(error))", category: "camera")
+                    continuation.resume(throwing: error)
+                }
             }
         }
     }
 
     private func configureSession(for target: AVCaptureDevice.Position) throws {
         dispatchPrecondition(condition: .onQueue(sessionQueue))
+        TestLog.shared.record("configure start position=\(target.rawValue)", category: "camera")
         isConfigured = false
-        depthFocusPoint = nil
         session.beginConfiguration()
         defer { session.commitConfiguration() }
         session.sessionPreset = .photo
@@ -313,7 +361,8 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
                   let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input) else { continue }
             session.addInput(input)
             let supported = photoOutput.isDepthDataDeliverySupported
-            print("[Capability] \(device.localizedName), type=\(type.rawValue), photoDepth=\(supported)")
+            TestLog.shared.record("[Capability] \(device.localizedName), type=\(type.rawValue), photoDepth=\(supported), " +
+                  "activeFormatDepthVariants=\(device.activeFormat.supportedDepthDataFormats.count)")
             if supported {
                 deviceInput = input
                 break
@@ -327,7 +376,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
             }
             session.addInput(input)
             deviceInput = input
-            print("[Capability] native depth unavailable; ordinary photo fallback")
+            TestLog.shared.record("[Capability] native depth unavailable; ordinary photo fallback")
         }
         guard let device = deviceInput?.device else { throw CameraError.configurationFailed }
         if photoOutput.isDepthDataDeliverySupported {
@@ -357,11 +406,12 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
         device.videoZoomFactor = CGFloat(DepthCapturePolicy.clampedZoom(
             desiredZoom, minimum: Double(device.minAvailableVideoZoomFactor),
             maximum: Double(device.maxAvailableVideoZoomFactor)))
+        userDidTapFocus = false
         position = target
         isConfigured = true
-        print("[Camera] configured depth=\(photoOutput.isDepthDataDeliveryEnabled), " +
+        TestLog.shared.record("[Camera] configured depth=\(photoOutput.isDepthDataDeliveryEnabled), " +
               "zoom=\(device.videoZoomFactor), available=[\(device.minAvailableVideoZoomFactor), \(device.maxAvailableVideoZoomFactor)], " +
-              "photo=\(photoOutput.maxPhotoDimensions.width)x\(photoOutput.maxPhotoDimensions.height)")
+              "photo=\(photoOutput.maxPhotoDimensions.width)x\(photoOutput.maxPhotoDimensions.height), matteSupported=\(photoOutput.isPortraitEffectsMatteDeliverySupported), matteEnabled=\(photoOutput.isPortraitEffectsMatteDeliveryEnabled)", category: "camera")
     }
 
     private func makeState() -> CameraState {
@@ -376,14 +426,20 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
     private func finishCapture(id: Int64, result: Result<CapturedPhoto, Error>) {
         guard let pending = pendingCapture, pending.id == id else { return }
         pendingCapture = nil
+        switch result {
+        case .success: TestLog.shared.record("capture completed; handing photo to renderer", category: "capture", captureID: id)
+        case .failure(let error): TestLog.shared.record("capture failed: \(TestLog.errorDescription(error))", category: "capture", captureID: id)
+        }
         pending.continuation.resume(with: result)
     }
 
     private func installSessionObservers() {
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: AVCaptureSession.wasInterruptedNotification,
-                                            object: session, queue: nil) { [weak self] _ in
+                                            object: session, queue: nil) { [weak self] notification in
             guard let self else { return }
+            let reason = (notification.userInfo?[AVCaptureSessionInterruptionReasonKey] as? NSNumber)?.intValue ?? -1
+            TestLog.shared.record("session interrupted reason=\(reason)", category: "camera")
             self.sessionQueue.async {
                 if let pending = self.pendingCapture {
                     self.finishCapture(id: pending.id, result: .failure(CameraError.interrupted))
@@ -395,6 +451,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
                                             object: session, queue: nil) { [weak self] _ in
             guard let self else { return }
             self.sessionQueue.async {
+                TestLog.shared.record("session interruption ended wantsToRun=\(self.wantsToRun)", category: "camera")
                 guard self.wantsToRun else { return }
                 if !self.session.isRunning { self.session.startRunning() }
                 self.eventHandler?(.ready(self.makeState()))
@@ -407,7 +464,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
             let reset = error?.code == AVError.Code.mediaServicesWereReset.rawValue
             let message = error?.localizedDescription ?? CameraError.unavailable.localizedDescription
             self.sessionQueue.async {
-                print("[Camera] runtime error: \(message)")
+                TestLog.shared.record("runtime error: \(error.map(TestLog.errorDescription) ?? message), mediaServicesReset=\(reset)", category: "camera")
                 if let pending = self.pendingCapture {
                     self.finishCapture(id: pending.id, result: .failure(CameraError.interrupted))
                 }

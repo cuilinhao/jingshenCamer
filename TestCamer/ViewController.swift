@@ -25,6 +25,8 @@ final class ViewController: UIViewController {
     private var isSaving = false
     private var isScreenVisible = false
     private var wantsDepth = true
+    private var isExportingLog = false
+    private let exportLogButton = UIButton(type: .system)
 
     private let depthPanel = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
     private let depthSwitch = UISwitch()
@@ -34,6 +36,8 @@ final class ViewController: UIViewController {
     private let apertureLabel = UILabel()
     private let resultInfoLabel = UILabel()
     private let compareButton = UIButton(type: .system)
+    private let diagnosticsButton = UIButton(type: .system)
+    private let comparisonControls = UIStackView()
     private let retryButton = UIButton(type: .system)
     private let processingSpinner = UIActivityIndicatorView(style: .large)
 
@@ -58,6 +62,7 @@ final class ViewController: UIViewController {
         view.backgroundColor = .black
         configurePreviewLayer()
         setupUI()
+        TestLog.shared.record("camera screen loaded", category: "ui")
         camera.setEventHandler { [weak self] event in
             Task { @MainActor [weak self] in self?.handleCameraEvent(event) }
         }
@@ -69,6 +74,11 @@ final class ViewController: UIViewController {
     }
 
     deinit { NotificationCenter.default.removeObserver(self) }
+
+    override func didReceiveMemoryWarning() {
+        super.didReceiveMemoryWarning()
+        TestLog.shared.record("memory warning isCapturing=\(isCapturing), hasResult=\(processedPhoto != nil)", category: "app")
+    }
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
@@ -108,6 +118,7 @@ final class ViewController: UIViewController {
     private func startCamera() async {
         guard isScreenVisible, capturedImage == nil, !isStarting, !isCapturing, !isSwitching,
               UIApplication.shared.applicationState != .background else { return }
+        TestLog.shared.record("start camera requested", category: "ui")
         isStarting = true
         statusLabel.isHidden = false
         statusLabel.text = "正在开启相机…"
@@ -168,6 +179,7 @@ final class ViewController: UIViewController {
     }
 
     private func showCameraUnavailable(_ error: Error) {
+        TestLog.shared.record("camera unavailable: \(TestLog.errorDescription(error))", category: "ui")
         statusLabel.isHidden = false
         statusLabel.text = error.localizedDescription
         cameraState = nil
@@ -199,8 +211,47 @@ final class ViewController: UIViewController {
 // MARK: - Actions
 
 private extension ViewController {
+    @objc func exportTestLog() {
+        guard !isExportingLog, presentedViewController == nil else { return }
+        isExportingLog = true
+        exportLogButton.isEnabled = false
+        exportLogButton.configuration?.title = "正在导出…"
+        TestLog.shared.record("export requested", category: "log")
+        Task {
+            defer {
+                isExportingLog = false
+                exportLogButton.isEnabled = true
+                exportLogButton.configuration?.title = "导出 TestLog"
+            }
+            do {
+                let file = try await Task.detached(priority: .utility) {
+                    try TestLog.shared.export()
+                }.value
+                guard view.window != nil, presentedViewController == nil,
+                      UIApplication.shared.applicationState == .active else {
+                    TestLog.shared.record("export prepared; share sheet unavailable because screen is inactive", category: "log")
+                    return
+                }
+                let share = UIActivityViewController(activityItems: [file], applicationActivities: nil)
+                share.popoverPresentationController?.sourceView = exportLogButton
+                share.popoverPresentationController?.sourceRect = exportLogButton.bounds
+                share.completionWithItemsHandler = { _, completed, _, error in
+                    TestLog.shared.record("share completed=\(completed), error=\(error.map(TestLog.errorDescription) ?? "none")", category: "log")
+                }
+                present(share, animated: true)
+            } catch {
+                TestLog.shared.record("export failed: \(TestLog.errorDescription(error))", category: "log")
+                presentAlert(title: "日志导出失败", message: error.localizedDescription)
+            }
+        }
+    }
+
     @objc func captureTapped() {
-        guard !isCapturing, !isSwitching, !isStarting, cameraState?.isRunning == true else { return }
+        guard !isCapturing, !isSwitching, !isStarting, cameraState?.isRunning == true else {
+            TestLog.shared.record("shutter ignored capturing=\(isCapturing), switching=\(isSwitching), starting=\(isStarting), running=\(cameraState?.isRunning == true)", category: "ui")
+            return
+        }
+        TestLog.shared.record("shutter tapped", category: "ui")
         // 快门时冻结 f 值、景深开关、方向。异步过程中后来的 UI 变化不影响这张照片。
         let options = DepthOptions(enabled: wantsDepth,
                                    aperture: DepthCapturePolicy.aperture(sliderValue: apertureSlider.value))
@@ -227,6 +278,7 @@ private extension ViewController {
                 statusLabel.text = payload.depthRequested ? "正在生成景深成片…" : "正在生成照片…"
                 let result = try await processor.process(payload)
                 guard let image = UIImage(data: result.previewData) else { throw CameraError.captureFailed }
+                TestLog.shared.record("result displayed outcome=\(result.outcome.rawValue), dimensions=\(result.pixelWidth)x\(result.pixelHeight)", category: "ui", captureID: result.captureID)
                 processedPhoto = result
                 originalComparisonImage = UIImage(data: result.originalPreviewData)
                 statusLabel.isHidden = true
@@ -275,6 +327,7 @@ private extension ViewController {
 
     @objc func retakeTapped() {
         guard !isSaving else { return }
+        TestLog.shared.record("retake requested", category: "ui", captureID: processedPhoto?.captureID)
         capturedImage = nil
         originalComparisonImage = nil
         processedPhoto = nil
@@ -283,6 +336,7 @@ private extension ViewController {
         resultControls.isHidden = true
         resultInfoLabel.isHidden = true
         compareButton.isHidden = true
+        comparisonControls.isHidden = true
         cameraControls.isHidden = false
         depthPanel.isHidden = false
         cameraState = nil
@@ -292,6 +346,7 @@ private extension ViewController {
 
     @objc func saveTapped() {
         guard let photo = processedPhoto, !isSaving else { return }
+        TestLog.shared.record("save requested bytes=\(photo.jpegData.count), outcome=\(photo.outcome.rawValue)", category: "save", captureID: photo.captureID)
         isSaving = true
         endComparison()
         updateControlAvailability()
@@ -301,6 +356,7 @@ private extension ViewController {
                 // 保存的是完整分辨率的编码成片，不是 UIImageView 里的预览缩略图。
                 // 即使按住“看原图”时点击保存，也不会误保存普通原图。
                 try await saveToPhotoLibrary(photo.jpegData)
+                TestLog.shared.record("saved to photo library", category: "save", captureID: photo.captureID)
                 UINotificationFeedbackGenerator().notificationOccurred(.success)
                 presentAlert(title: "已保存", message: "\(photo.outcome.message)已保存到相册。\n不包含可重编辑的聚焦位置。")
             } catch {
@@ -311,6 +367,7 @@ private extension ViewController {
 
     @objc func depthSwitchChanged() {
         wantsDepth = depthSwitch.isOn
+        TestLog.shared.record("depth enabled=\(wantsDepth)", category: "ui")
         updateDepthPanel()
     }
 
@@ -320,7 +377,7 @@ private extension ViewController {
     }
 
     @objc func beginComparison() {
-        guard !isSaving, processedPhoto?.outcome.isDepthApplied == true else { return }
+        guard !isSaving, processedPhoto?.outcome.canCompare == true else { return }
         capturedImageView.image = originalComparisonImage
         compareButton.configuration?.title = "原图 · 松开看成片"
     }
@@ -328,6 +385,16 @@ private extension ViewController {
     @objc func endComparison() {
         capturedImageView.image = capturedImage
         compareButton.configuration?.title = "按住看原图"
+    }
+
+    @objc func showDepthDiagnostics() {
+        guard let photo = processedPhoto, !isSaving, presentedViewController == nil else { return }
+        endComparison()
+        let screen = DepthDiagnosticsViewController(text: photo.diagnosticText, maskData: photo.diagnosticMaskData)
+        let navigation = UINavigationController(rootViewController: screen)
+        navigation.modalPresentationStyle = .pageSheet
+        navigation.sheetPresentationController?.detents = [.large()]
+        present(navigation, animated: true)
     }
 
     @objc func handlePinch(_ gesture: UIPinchGestureRecognizer) {
@@ -404,6 +471,19 @@ private extension ViewController {
         resultControls.addArrangedSubview(retakeButton)
         resultControls.addArrangedSubview(saveButton)
         view.addSubview(resultControls)
+        var logConfig = UIButton.Configuration.filled()
+        logConfig.title = "导出 TestLog"
+        logConfig.image = UIImage(systemName: "square.and.arrow.up")
+        logConfig.imagePadding = 6
+        logConfig.baseForegroundColor = .white
+        logConfig.baseBackgroundColor = UIColor.black.withAlphaComponent(0.55)
+        logConfig.cornerStyle = .capsule
+        logConfig.buttonSize = .small
+        exportLogButton.configuration = logConfig
+        exportLogButton.accessibilityIdentifier = "exportTestLog"
+        exportLogButton.translatesAutoresizingMaskIntoConstraints = false
+        exportLogButton.addTarget(self, action: #selector(exportTestLog), for: .touchUpInside)
+        view.addSubview(exportLogButton)
         setupDepthControls()
 
         focusIndicator.frame = CGRect(x: 0, y: 0, width: 72, height: 72)
@@ -533,9 +613,11 @@ private extension ViewController {
         retryButton.isHidden = true
         focusIndicator.alpha = 0
         if let photo = processedPhoto {
-            let aperture = photo.outcome.isDepthApplied ? String(format: " · f/%.1f", photo.aperture) : ""
+            let aperture = photo.outcome.canCompare ? String(format: " · f/%.1f", photo.aperture) : ""
             resultInfoLabel.text = "  \(photo.outcome.message)\(aperture)  \n  \(photo.pixelWidth) × \(photo.pixelHeight) · JPEG  "
-            compareButton.isHidden = !photo.outcome.isDepthApplied
+            compareButton.isHidden = !photo.outcome.canCompare
+            comparisonControls.isHidden = false
+            resultInfoLabel.textColor = photo.outcome.isDepthApplied ? .white : .systemYellow
         }
         camera.stop()
     }
@@ -586,6 +668,7 @@ private extension ViewController {
 
     func saveToPhotoLibrary(_ data: Data) async throws {
         let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+        TestLog.shared.record("photo library add permission=\(status.rawValue)", category: "save", captureID: processedPhoto?.captureID)
         guard status == .authorized || status == .limited else {
             throw CameraError.photoLibraryDenied
         }
@@ -599,13 +682,14 @@ private extension ViewController {
     }
 
     func presentError(_ error: Error) {
+        TestLog.shared.record("operation failed: \(TestLog.errorDescription(error))", category: "ui")
         presentAlert(title: "无法完成操作", message: error.localizedDescription)
     }
 
     func presentAlert(title: String, message: String) {
         guard isScreenVisible, UIApplication.shared.applicationState != .background,
               presentedViewController == nil else {
-            print("[UI] \(title): \(message)")
+            TestLog.shared.record("alert not shown: \(title): \(message)", category: "ui")
             return
         }
         let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
@@ -624,7 +708,7 @@ private extension ViewController {
         depthPanel.clipsToBounds = true
         view.addSubview(depthPanel)
 
-        depthTitleLabel.text = "拍后景深"
+        depthTitleLabel.text = "拍后景深 · v2"
         depthTitleLabel.font = .systemFont(ofSize: 16, weight: .semibold)
         depthTitleLabel.textColor = .white
         depthHintLabel.font = .systemFont(ofSize: 12)
@@ -673,7 +757,15 @@ private extension ViewController {
         compareButton.addTarget(self, action: #selector(endComparison),
                                 for: [.touchUpOutside, .touchCancel, .touchDragExit])
         compareButton.isHidden = true
-        view.addSubview(compareButton)
+        configureTextButton(diagnosticsButton, title: "景深诊断", action: #selector(showDepthDiagnostics))
+        comparisonControls.axis = .horizontal
+        comparisonControls.distribution = .fillEqually
+        comparisonControls.spacing = 12
+        comparisonControls.translatesAutoresizingMaskIntoConstraints = false
+        comparisonControls.addArrangedSubview(compareButton)
+        comparisonControls.addArrangedSubview(diagnosticsButton)
+        comparisonControls.isHidden = true
+        view.addSubview(comparisonControls)
         configureTextButton(retryButton, title: "重新开启相机", action: #selector(retryCameraTapped))
         retryButton.isHidden = true
         view.addSubview(retryButton)
@@ -683,7 +775,10 @@ private extension ViewController {
         view.addSubview(processingSpinner)
 
         NSLayoutConstraint.activate([
-            depthPanel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
+            exportLogButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
+            exportLogButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -20),
+            exportLogButton.heightAnchor.constraint(equalToConstant: 36),
+            depthPanel.topAnchor.constraint(equalTo: exportLogButton.bottomAnchor, constant: 12),
             depthPanel.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 20),
             depthPanel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -20),
             stack.topAnchor.constraint(equalTo: depthPanel.contentView.topAnchor, constant: 10),
@@ -691,12 +786,14 @@ private extension ViewController {
             stack.trailingAnchor.constraint(equalTo: depthPanel.contentView.trailingAnchor, constant: -14),
             stack.bottomAnchor.constraint(equalTo: depthPanel.contentView.bottomAnchor, constant: -10),
             apertureLabel.widthAnchor.constraint(equalToConstant: 62),
-            resultInfoLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 14),
+            resultInfoLabel.topAnchor.constraint(equalTo: exportLogButton.bottomAnchor, constant: 12),
             resultInfoLabel.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 20),
             resultInfoLabel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -20),
             resultInfoLabel.heightAnchor.constraint(greaterThanOrEqualToConstant: 56),
-            compareButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            compareButton.bottomAnchor.constraint(equalTo: resultControls.topAnchor, constant: -16),
+            comparisonControls.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 24),
+            comparisonControls.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -24),
+            comparisonControls.bottomAnchor.constraint(equalTo: resultControls.topAnchor, constant: -16),
+            comparisonControls.heightAnchor.constraint(equalToConstant: 44),
             retryButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             retryButton.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 20),
             processingSpinner.centerXAnchor.constraint(equalTo: view.centerXAnchor),
@@ -709,13 +806,13 @@ private extension ViewController {
         let supported = cameraState?.depthSupported == true
         let active = supported && wantsDepth
         depthSwitch.setOn(active, animated: false)
-        depthTitleLabel.text = supported ? "拍后景深" : "普通拍照"
+        depthTitleLabel.text = supported ? "拍后景深 · v2" : "普通拍照 · v2"
         if cameraState == nil {
             depthHintLabel.text = "正在检测当前相机的原生深度能力…"
         } else if !supported {
             depthHintLabel.text = "当前相机不支持原生深度，仍可普通拍照。"
         } else {
-            depthHintLabel.text = active ? "仅成片虚化 · 可点按主体选择清晰区域" : "景深已关闭 · 成片不添加算法虚化"
+            depthHintLabel.text = active ? "预览不虚化 · 请点选主体后拍摄\n仅本次选焦，不保存聚焦位置" : "景深已关闭 · 成片不添加算法虚化"
         }
         let aperture = DepthCapturePolicy.aperture(sliderValue: apertureSlider.value)
         apertureLabel.text = String(format: "f/%.1f", aperture)
@@ -737,6 +834,7 @@ private extension ViewController {
         retakeButton.isEnabled = !isSaving && !isCapturing
         saveButton.isEnabled = processedPhoto != nil && !isSaving && !isCapturing
         compareButton.isEnabled = !isSaving
+        diagnosticsButton.isEnabled = processedPhoto != nil && !isSaving
         updateDepthPanel()
     }
 }

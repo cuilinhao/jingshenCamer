@@ -14,8 +14,19 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-        // Override point for customization after application launch.
+        let info = Bundle.main.infoDictionary ?? [:]
+        var system = utsname()
+        uname(&system)
+        let hardware = withUnsafeBytes(of: &system.machine) {
+            String(decoding: $0.prefix(while: { $0 != 0 }), as: UTF8.self)
+        }
+        TestLog.shared.record("launch revision=depth-quality-TestLog-2026-09-22, version=\(info["CFBundleShortVersionString"] ?? "unknown"), build=\(info["CFBundleVersion"] ?? "unknown"), hardware=\(hardware), system=\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)", category: "app")
         return true
+    }
+
+    func applicationWillTerminate(_ application: UIApplication) {
+        TestLog.shared.record("application will terminate", category: "app")
+        TestLog.shared.flush()
     }
 
     // MARK: UISceneSession Lifecycle

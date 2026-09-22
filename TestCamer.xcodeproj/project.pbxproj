@@ -134,10 +134,11 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = RUCPUS7G68;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = TestCamer/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "TestCamer 景深v2";
 				INFOPLIST_KEY_NSCameraUsageDescription = "需要使用相机进行拍照";
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "需要将拍摄的照片保存到相册";
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -166,10 +167,11 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = RUCPUS7G68;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = TestCamer/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "TestCamer 景深v2";
 				INFOPLIST_KEY_NSCameraUsageDescription = "需要使用相机进行拍照";
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "需要将拍摄的照片保存到相册";
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
