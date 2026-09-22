@@ -1,5 +1,5 @@
 // DepthPhotoProcessor.swift — 苹果公开景深与同帧旧版对照
-// 只处理一次快门的照片，不参与普通取景。原图/深度/瞬时选焦只存在本次内存任务中。
+// 只处理一次快门的照片，不参与普通取景；可编辑源由独立照片存储管理。
 import Foundation
 import CoreImage
 import CoreGraphics
@@ -8,7 +8,7 @@ import UniformTypeIdentifiers
 @preconcurrency import Vision
 
 struct ProcessedPhoto: Sendable {
-    /// 只允许保存此完整分辨率 JPEG，不保存预览图、焦点、深度或 Recipe。
+    /// 系统相册使用完整分辨率 JPEG；本机可编辑文档另存源文件和参数。
     let jpegData: Data
     let previewData: Data
     let originalPreviewData: Data
@@ -24,6 +24,8 @@ struct ProcessedPhoto: Sendable {
     let usedAppleMetadataCompatibility: Bool
     let diagnosticImageIsDifference: Bool
     var legacyComparison: LegacyDepthComparison? = nil
+    /// 苹果景深成功时保留实际初始焦点，供本机拍后编辑准确恢复。
+    var editRecipe: PhotoEditRecipe? = nil
 
     var rendererTitle: String {
         usedAppleMetadataCompatibility ? "苹果景深（兼容）" : renderer.title
@@ -129,6 +131,7 @@ final class DepthPhotoProcessor: @unchecked Sendable {
         var outputCG: CGImage?
         var diagnosticMaskData: Data?
         var usedAppleMetadataCompatibility = false
+        var selectedEditRecipe: PhotoEditRecipe?
 
         if !photo.options.enabled {
             outcome = .disabled
@@ -160,9 +163,14 @@ final class DepthPhotoProcessor: @unchecked Sendable {
                 finish("source=\(selection.source)")
                 let result: DepthBlurOutput
                 if renderer == .apple {
+                    // A usable map may still have a hole exactly under the
+                    // selected point. Avoid saving an initial recipe that the
+                    // post-capture editor cannot reliably reproduce.
+                    guard depth.value(at: focus) != nil else { throw DepthAnalysisError.focusUnavailable }
                     begin("apple_depth_render")
                     let inverseEXIF: UInt32 = exif == 6 ? 8 : (exif == 8 ? 6 : exif)
                     let sensorFocus = focus.oriented(exif: inverseEXIF)
+                    selectedEditRecipe = PhotoEditRecipe(aperture: photo.options.aperture, sensorFocus: sensorFocus)
                     let apple = try AppleDepthRenderer(context: context).render(photoData: photo.data,
                         aperture: photo.options.aperture, sensorFocus: sensorFocus)
                     usedAppleMetadataCompatibility = apple.usedMetadataCompatibility
@@ -273,24 +281,25 @@ final class DepthPhotoProcessor: @unchecked Sendable {
                               outcome: outcome, aperture: photo.options.aperture,
                               pixelWidth: image.width, pixelHeight: image.height, captureID: photo.captureID,
                               renderer: renderer, usedAppleMetadataCompatibility: usedAppleMetadataCompatibility,
-                              diagnosticImageIsDifference: renderer == .apple)
+                              diagnosticImageIsDifference: renderer == .apple,
+                              editRecipe: renderer == .apple && outcome.canCompare ? selectedEditRecipe : nil)
     }
 
     /// 点按优先；未点按时，用人脸中心的深度或画面中心深度。Vision 只检测框，不做人像替换。
-    /// 点位只在当前调用链传递，不进入 ProcessedPhoto、照片 EXIF、JSON 或磁盘。
+    /// 点位仅进入本机可编辑参数，不写入系统相册 JPEG 或诊断日志。
     private func choosePlane(original: CIImage, depth: DepthRaster,
                              transientDeviceFocus: NormalizedImagePoint?, exif: UInt32, captureID: Int64?)
         -> (point: NormalizedImagePoint?, isPerson: Bool, source: String) {
         if let devicePoint = transientDeviceFocus {
             let point = devicePoint.oriented(exif: exif)
             // 人物关联由同帧人物 mask 判定；相对视差值的比例不能判断是否同一个人。
-            return (point, false, "本次点按（处理后不保留）")
+            return (point, false, "本次点按")
         }
         let faceCenters = detectFaceCenters(original, captureID: captureID)
         if let face = faceCenters.first(where: { depth.value(at: $0) != nil }) {
             return (face, true, "自动人脸深度平面")
         }
-        return (nil, false, "自动中心深度平面；非居中物体请在拍前点选")
+        return (nil, false, "自动中心深度平面")
     }
 
     private func detectFaceCenters(_ original: CIImage, captureID: Int64?) -> [NormalizedImagePoint] {

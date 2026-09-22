@@ -1,11 +1,11 @@
 //
 // DepthMath.swift — 纯 Swift 数值部分，不依赖相机、Core Image 或 UIKit。
 // 视差越大越近；不把相对视差当作精确米数，不把 unknown 当背景。
-// 所有点位只存在于单次拍摄内存中，无 Codable / 文件持久化。
+// 原始传感器点位可随本机可编辑照片保存，用于拍后重渲染。
 //
 import Foundation
 
-struct NormalizedImagePoint: Sendable, Equatable {
+struct NormalizedImagePoint: Sendable, Equatable, Codable {
     /// 左上原点、完整图像归一化坐标；不是屏幕像素。
     let x: Double
     let y: Double

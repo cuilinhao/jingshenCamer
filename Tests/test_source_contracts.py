@@ -37,17 +37,8 @@ class SourceContracts(unittest.TestCase):
         self.assertIn('EffectMeasurement', p)
         self.assertIn('measurement.hasVisibleChange ? .applied : .weakEffect', p)
         self.assertIn('fallback=ordinary photo', p)
-    def test_only_baked_jpeg_is_saved_and_no_focus_persistence(self):
-        # TestLog is the explicit diagnostic text sink requested by the user.
-        # Image/depth/focus processing still may not write to disk directly.
-        src = '\n'.join(p.read_text() for p in APP.glob('*.swift') if p.name != 'TestLog.swift')
-        self.assertNotRegex(src, r'JSONEncoder|JSONDecoder|UserDefaults|write\(to:|NSKeyedArchiver|URLSession')
-        result_struct = self.read('DepthPhotoProcessor.swift').split('struct ProcessedPhoto: Sendable {', 1)[1].split('\n}', 1)[0]
-        self.assertNotRegex(result_struct, r'let\s+\w*(?:Focus|focus|depth|Depth)\w*\s*:')
-        vc = self.read('ViewController.swift')
-        self.assertIn('saveToPhotoLibrary(photo.jpegData)', vc)
-        self.assertIn('camera.focus(at:', vc)
-        self.assertIn('hasDepthData', self.read('CaptureModels.swift'))
+    # 本机文档持久化现已由真实 PhotoEditingStoreTests 覆盖；
+    # JPEG 无深度/焦点附件由真实 PhotoEditingRenderTests 验证。
     def test_no_external_depth_model_fallback(self):
         src = '\n'.join(p.read_text() for p in APP.glob('*.swift'))
         # Apple 人物 mask 仅保护真实深度渲染中的主体；无深度回退由原生管线测试验证。

@@ -1,4 +1,4 @@
-// CaptureModels.swift — 单次拍摄的值类型；无持久化。
+// CaptureModels.swift — 单次拍摄值类型；完整容器可交给本机编辑文档保存。
 import Foundation
 
 // 工程不再默认把所有类型隔离到 MainActor；相机可变状态只在 sessionQueue 访问。
@@ -20,14 +20,14 @@ enum CameraError: LocalizedError, Equatable, Sendable {
     }
 }
 
-/// 原始文件只在当前处理任务中存在。处理结果不携带以下瞬时深度或点位。
+/// 原始相机容器用于首次渲染，并可保存在可编辑照片中供拍后换焦。
 struct CapturedPhoto: Sendable {
     let data: Data
     let depthRequested: Bool
     let hasDepthData: Bool
     let nativeDepth: NativeDepthSnapshot?
     let options: DepthOptions
-    /// 相机拥有的硬件焦点，在快门时读取，只供这一次渲染；不显示/保存坐标。
+    /// 快门时的硬件焦点；首次渲染解析出的焦点另存为编辑参数，不写入导出 JPEG。
     let transientDeviceFocus: NormalizedImagePoint?
     let captureSummary: String
     let nativePortraitMatte: NativePortraitMatteSnapshot?

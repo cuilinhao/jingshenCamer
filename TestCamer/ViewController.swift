@@ -20,6 +20,9 @@ final class ViewController: UIViewController {
     private var legacyComparisonImage: UIImage?
     private var processedPhoto: ProcessedPhoto?
     private let processor = DepthPhotoProcessor()
+    private let editableStore = EditablePhotoStore()
+    private let libraryButton = UIButton(type: .system)
+    private var pendingEditor: PhotoEditorViewController?
     private var cameraState: CameraState?
     private var isStarting = false
     private var isSwitching = false
@@ -95,6 +98,7 @@ final class ViewController: UIViewController {
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        presentPendingEditor()
         Task { await startCamera() }
     }
 
@@ -145,7 +149,10 @@ final class ViewController: UIViewController {
         }
     }
 
-    @objc private func appDidBecomeActive() { Task { await startCamera() } }
+    @objc private func appDidBecomeActive() {
+        presentPendingEditor()
+        Task { await startCamera() }
+    }
 
     @objc private func appDidEnterBackground() {
         camera.stop()
@@ -214,8 +221,9 @@ final class ViewController: UIViewController {
 
 private extension ViewController {
     @objc func exportTestLog() {
-        guard !isExportingLog, presentedViewController == nil else { return }
+        guard !isExportingLog, !isCapturing, !isStarting, !isSwitching, presentedViewController == nil else { return }
         isExportingLog = true
+        updateControlAvailability()
         exportLogButton.isEnabled = false
         exportLogButton.configuration?.title = "正在导出…"
         TestLog.shared.record("export requested", category: "log")
@@ -224,6 +232,7 @@ private extension ViewController {
                 isExportingLog = false
                 exportLogButton.isEnabled = true
                 exportLogButton.configuration?.title = "导出 TestLog"
+                updateControlAvailability()
             }
             do {
                 let file = try await Task.detached(priority: .utility) {
@@ -248,8 +257,36 @@ private extension ViewController {
         }
     }
 
+    func preparePhotoEditor(document: EditablePhotoDocument, result: ProcessedPhoto, saveError: String?) {
+        let editor = PhotoEditorViewController(document: document, store: editableStore,
+            originalPreviewData: result.originalPreviewData, initialSaveError: saveError,
+            captureDiagnostics: result)
+        editor.onClose = { [weak self] in self?.retakeTapped() }
+        pendingEditor = editor
+        presentPendingEditor()
+    }
+
+    func presentPendingEditor() {
+        guard let editor = pendingEditor, isScreenVisible, view.window != nil,
+              UIApplication.shared.applicationState == .active, presentedViewController == nil else { return }
+        pendingEditor = nil
+        let navigation = UINavigationController(rootViewController: editor)
+        navigation.overrideUserInterfaceStyle = .dark
+        navigation.modalPresentationStyle = .fullScreen
+        present(navigation, animated: true)
+    }
+
+    @objc func showEditableLibrary() {
+        guard !isCapturing, !isSaving, !isStarting, !isSwitching, !isExportingLog, presentedViewController == nil else { return }
+        let library = EditablePhotoLibraryViewController(store: editableStore)
+        let navigation = UINavigationController(rootViewController: library)
+        navigation.overrideUserInterfaceStyle = .dark
+        navigation.modalPresentationStyle = .fullScreen
+        present(navigation, animated: true)
+    }
+
     @objc func captureTapped() {
-        guard !isCapturing, !isSwitching, !isStarting, cameraState?.isRunning == true else {
+        guard !isCapturing, !isSwitching, !isStarting, !isExportingLog, cameraState?.isRunning == true else {
             TestLog.shared.record("shutter ignored capturing=\(isCapturing), switching=\(isSwitching), starting=\(isStarting), running=\(cameraState?.isRunning == true)", category: "ui")
             return
         }
@@ -288,6 +325,14 @@ private extension ViewController {
                 }
                 statusLabel.isHidden = true
                 showCapturedImage(image)
+                if let recipe = result.editRecipe {
+                    let document = EditablePhotoDocument(sourceData: payload.data, initialRecipe: recipe,
+                        recipe: recipe, previewData: result.previewData)
+                    var saveError: String?
+                    do { try await editableStore.save(document) }
+                    catch { saveError = error.localizedDescription }
+                    preparePhotoEditor(document: document, result: result, saveError: saveError)
+                }
             } catch {
                 cameraState = try? await camera.currentState()
                 statusLabel.isHidden = cameraState?.isRunning == true
@@ -333,6 +378,7 @@ private extension ViewController {
     @objc func retakeTapped() {
         guard !isSaving else { return }
         TestLog.shared.record("retake requested", category: "ui", captureID: processedPhoto?.captureID)
+        pendingEditor = nil
         capturedImage = nil
         originalComparisonImage = nil
         legacyComparisonImage = nil
@@ -502,6 +548,19 @@ private extension ViewController {
         exportLogButton.translatesAutoresizingMaskIntoConstraints = false
         exportLogButton.addTarget(self, action: #selector(exportTestLog), for: .touchUpInside)
         view.addSubview(exportLogButton)
+        var libraryConfig = UIButton.Configuration.filled()
+        libraryConfig.title = "可编辑照片"
+        libraryConfig.image = UIImage(systemName: "photo.on.rectangle")
+        libraryConfig.imagePadding = 5
+        libraryConfig.baseForegroundColor = .white
+        libraryConfig.baseBackgroundColor = UIColor.black.withAlphaComponent(0.55)
+        libraryConfig.cornerStyle = .capsule
+        libraryConfig.buttonSize = .small
+        libraryButton.configuration = libraryConfig
+        libraryButton.accessibilityIdentifier = "editablePhotoLibrary"
+        libraryButton.translatesAutoresizingMaskIntoConstraints = false
+        libraryButton.addTarget(self, action: #selector(showEditableLibrary), for: .touchUpInside)
+        view.addSubview(libraryButton)
         setupDepthControls()
 
         focusIndicator.frame = CGRect(x: 0, y: 0, width: 72, height: 72)
@@ -814,6 +873,10 @@ private extension ViewController {
         view.addSubview(processingSpinner)
 
         NSLayoutConstraint.activate([
+            libraryButton.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 20),
+            libraryButton.centerYAnchor.constraint(equalTo: exportLogButton.centerYAnchor),
+            libraryButton.trailingAnchor.constraint(lessThanOrEqualTo: exportLogButton.leadingAnchor, constant: -8),
+            libraryButton.heightAnchor.constraint(equalToConstant: 36),
             exportLogButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
             exportLogButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -20),
             exportLogButton.heightAnchor.constraint(equalToConstant: 36),
@@ -851,7 +914,7 @@ private extension ViewController {
         } else if !supported {
             depthHintLabel.text = "当前相机不支持原生深度，仍可普通拍照。"
         } else {
-            depthHintLabel.text = active ? "点选清晰主体后拍摄 · 成片生成景深\n拍完可按住对比原图和旧版效果" : "景深已关闭 · 成片不添加算法虚化"
+            depthHintLabel.text = active ? "点选清晰主体后拍摄 · 成片生成景深\n拍完可换焦、调光圈并保存编辑" : "景深已关闭 · 成片不添加算法虚化"
         }
         let aperture = DepthCapturePolicy.aperture(sliderValue: apertureSlider.value)
         apertureLabel.text = String(format: "f/%.1f", aperture)
@@ -864,7 +927,9 @@ private extension ViewController {
 
     func updateControlAvailability() {
         let ready = isScreenVisible && cameraState?.isRunning == true && capturedImage == nil
-            && !isStarting && !isCapturing && !isSwitching
+            && !isStarting && !isCapturing && !isSwitching && !isExportingLog
+        exportLogButton.isEnabled = !isCapturing && !isStarting && !isSwitching && !isExportingLog
+        libraryButton.isEnabled = !isCapturing && !isSaving && !isStarting && !isSwitching && !isExportingLog
         shutterButton.isEnabled = ready
         shutterButton.alpha = ready ? 1 : 0.5
         switchButton.isEnabled = ready
