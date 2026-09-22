@@ -32,11 +32,14 @@ struct CapturedPhoto: Sendable {
     let captureSummary: String
     let nativePortraitMatte: NativePortraitMatteSnapshot?
     let captureID: Int64?
+    /// 快门时冻结：后置主摄优先保留原生容器并调用苹果景深；其他镜头用智能景深。
+    let prefersAppleDepth: Bool
 
     init(data: Data, depthRequested: Bool, hasDepthData: Bool,
          nativeDepth: NativeDepthSnapshot?, options: DepthOptions,
          transientDeviceFocus: NormalizedImagePoint?, captureSummary: String,
-         nativePortraitMatte: NativePortraitMatteSnapshot? = nil, captureID: Int64? = nil) {
+         nativePortraitMatte: NativePortraitMatteSnapshot? = nil, captureID: Int64? = nil,
+         prefersAppleDepth: Bool = false) {
         self.data = data
         self.depthRequested = depthRequested
         self.hasDepthData = hasDepthData
@@ -46,5 +49,6 @@ struct CapturedPhoto: Sendable {
         self.captureSummary = captureSummary
         self.nativePortraitMatte = nativePortraitMatte
         self.captureID = captureID
+        self.prefersAppleDepth = prefersAppleDepth
     }
 }

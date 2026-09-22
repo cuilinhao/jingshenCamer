@@ -16,7 +16,7 @@ final class DepthDiagnosticsViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        title = "景深诊断 · v3"
+        title = "景深诊断"
         view.backgroundColor = .systemBackground
         navigationItem.leftBarButtonItem = UIBarButtonItem(title: "完成", style: .done,
                                                            target: self, action: #selector(close))
@@ -46,7 +46,7 @@ final class DepthDiagnosticsViewController: UIViewController {
         explanation.numberOfLines = 0
         let imageExplanation = isOutputDifference
             ? "下方是成片与原图的像素差异图（放大 4 倍）。越亮表示变化越大；黑色表示变化较小。它不是苹果滤镜的内部虚化遮罩，也不能单独证明画质合格。"
-            : "下方是旧版处理实际使用的虚化分布。白色越亮，虚化半径越大；黑色表示保留清晰或深度无效。"
+            : "下方是本次处理使用的虚化分布。白色越亮，虚化半径越大；黑色表示保留清晰或深度无效。"
         explanation.text = imageExplanation + "\n\n诊断文字会写入 TestLog，可从拍摄页右上角导出；不写入照片，也不记录聚焦坐标。"
         stack.addArrangedSubview(explanation)
         if let maskData, let image = UIImage(data: maskData) {

@@ -1,4 +1,4 @@
-// DepthPhotoProcessor.swift — 苹果公开景深与同帧旧版对照
+// DepthPhotoProcessor.swift — 主摄优先苹果原生景深，其他镜头与失败回退使用计算景深
 // 只处理一次快门的照片，不参与普通取景；可编辑源由独立照片存储管理。
 import Foundation
 import CoreImage
@@ -14,7 +14,7 @@ struct ProcessedPhoto: Sendable {
     let originalPreviewData: Data
     let diagnosticMaskData: Data?
     /// 不含坐标、焦平面距离或人脸框，只含能力、质量和输出检查信息。
-    let diagnosticText: String
+    var diagnosticText: String
     let outcome: DepthRenderOutcome
     let aperture: Float
     let pixelWidth: Int
@@ -24,8 +24,10 @@ struct ProcessedPhoto: Sendable {
     let usedAppleMetadataCompatibility: Bool
     let diagnosticImageIsDifference: Bool
     var legacyComparison: LegacyDepthComparison? = nil
-    /// 苹果景深成功时保留实际初始焦点，供本机拍后编辑准确恢复。
+    /// 景深成功时保留实际初始焦点，供本机拍后编辑准确恢复。
     var editRecipe: PhotoEditRecipe? = nil
+    /// 传感器坐标的不可变视差附件；与原始容器一起保存在本机。
+    var editDepthData: Data? = nil
 
     var rendererTitle: String {
         usedAppleMetadataCompatibility ? "苹果景深（兼容）" : renderer.title
@@ -42,14 +44,23 @@ final class DepthPhotoProcessor: @unchecked Sendable {
     private let renderQueue = DispatchQueue(label: "com.testcamer.photo-depth", qos: .userInitiated)
     private let context = CIContext(options: [.cacheIntermediates: false])
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+    private let depthEstimator: (@Sendable (CIImage) throws -> DepthRaster)?
+    private lazy var monocularEstimator = MonocularDepthEstimator(context: context)
 
-    func process(_ photo: CapturedPhoto, renderer: DepthRenderingMethod = .apple,
+    init(depthEstimator: (@Sendable (CIImage) throws -> DepthRaster)? = nil) {
+        self.depthEstimator = depthEstimator
+    }
+
+    func process(_ photo: CapturedPhoto, renderer requestedRenderer: DepthRenderingMethod? = nil,
                  includeLegacyComparison: Bool = false) async throws -> ProcessedPhoto {
         let queued = ProcessInfo.processInfo.systemUptime
+        let prefersApple = requestedRenderer == nil && photo.prefersAppleDepth && photo.options.enabled
+        let canTryApple = photo.depthRequested && photo.hasDepthData && photo.nativeDepth != nil
+        let renderer = requestedRenderer ?? (prefersApple && canTryApple ? .apple : .computational)
         TestLog.shared.record("process queued bytes=\(photo.data.count) enabled=\(photo.options.enabled) " +
             "depthRequested=\(photo.depthRequested) hasDepth=\(photo.hasDepthData) " +
             "nativeDepth=\(photo.nativeDepth != nil) nativeMatte=\(photo.nativePortraitMatte != nil) " +
-            "tapGiven=\(photo.transientDeviceFocus != nil)", category: "processor", captureID: photo.captureID)
+            "tapGiven=\(photo.transientDeviceFocus != nil) prefersApple=\(prefersApple)", category: "processor", captureID: photo.captureID)
         return try await withCheckedThrowingContinuation { continuation in
             renderQueue.async { [self] in
                 TestLog.shared.record(String(format: "process started queueSeconds=%.3f",
@@ -57,7 +68,19 @@ final class DepthPhotoProcessor: @unchecked Sendable {
                 let result: Result<ProcessedPhoto, Error> = autoreleasepool {
                     Result {
                         var primary = try render(photo, renderer: renderer)
-                        if includeLegacyComparison, renderer == .apple, photo.options.enabled,
+                        var appleFallbackReason: String?
+                        if prefersApple, renderer == .apple, !primary.outcome.canCompare {
+                            appleFallbackReason = primary.outcome.rawValue
+                            primary = try render(photo, renderer: .computational)
+                        } else if prefersApple, renderer != .apple {
+                            appleFallbackReason = "native depth unavailable"
+                        }
+                        if let reason = appleFallbackReason {
+                            let note = "preferredRenderer=apple\nappleFallbackReason=\(reason)\nactualRenderer=\(primary.renderer.rawValue)"
+                            primary.diagnosticText += "\n" + note
+                            TestLog.shared.record(note, category: "processor", captureID: photo.captureID)
+                        }
+                        if includeLegacyComparison, primary.renderer == .apple, photo.options.enabled,
                            photo.hasDepthData, photo.nativeDepth != nil {
                             // 串行处理完全相同的输入；仅保留旧版预览，不能影响主结果或保存目标。
                             do {
@@ -83,6 +106,7 @@ final class DepthPhotoProcessor: @unchecked Sendable {
 
     private func render(_ photo: CapturedPhoto, renderer: DepthRenderingMethod) throws -> ProcessedPhoto {
         dispatchPrecondition(condition: .onQueue(renderQueue))
+        if renderer == .computational { return try renderComputational(photo) }
         let started = Date()
         defer { context.clearCaches() }
         var stage = "decode"
@@ -283,6 +307,137 @@ final class DepthPhotoProcessor: @unchecked Sendable {
                               renderer: renderer, usedAppleMetadataCompatibility: usedAppleMetadataCompatibility,
                               diagnosticImageIsDifference: renderer == .apple,
                               editRecipe: renderer == .apple && outcome.canCompare ? selectedEditRecipe : nil)
+    }
+
+    /// Native and estimated maps share a renderer and a durable edit format.
+    /// No synthetic map is inserted into AVDepthData or labelled metric depth.
+    private func renderComputational(_ photo: CapturedPhoto) throws -> ProcessedPhoto {
+        defer { context.clearCaches() }
+        let started = ProcessInfo.processInfo.systemUptime
+        guard let source = CGImageSourceCreateWithData(photo.data as CFData, nil),
+              let raw = CIImage(data: photo.data, options: [.applyOrientationProperty: false]) else {
+            throw CameraError.captureFailed
+        }
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] ?? [:]
+        let exif = (properties[kCGImagePropertyOrientation as String] as? NSNumber)?.uint32Value ?? 1
+        let orientation = CGImagePropertyOrientation(rawValue: exif) ?? .up
+        let original = normalizedOrigin(raw.oriented(orientation))
+            .settingProperties([kCGImagePropertyOrientation as String: 1])
+        guard !original.extent.isEmpty, !original.extent.isInfinite else { throw CameraError.captureFailed }
+        var output = original
+        var outcome: DepthRenderOutcome = .disabled
+        var attachment: Data?
+        var recipe: PhotoEditRecipe?
+        var diagnostic: Data?
+        var notes = ["TestCamer ComputationalDepth v4", photo.captureSummary,
+                     "renderer=computational", "exifApplied=\(orientation.rawValue)",
+                     "depthUnits=relative disparity; not meters"]
+        if photo.options.enabled {
+            do {
+                let depth: DepthRaster
+                let depthSource: PhotoDepthSource
+                var nativeSelection: (point: NormalizedImagePoint?, isPerson: Bool, source: String)?
+                // A delivered map may contain invalid samples or have the wrong
+                // field of view. Those maps cannot suppress the estimator fallback.
+                let native = photo.nativeDepth.flatMap { snapshot -> DepthRaster? in
+                    let upright = snapshot.raster.oriented(exif: orientation.rawValue)
+                    guard abs((CGFloat(upright.width)/CGFloat(upright.height)) /
+                              (original.extent.width/original.extent.height) - 1) <= 0.02,
+                          let validated = try? PhotoDepthData(raster: upright, source: .native) else { return nil }
+                    let selection = choosePlane(original: original, depth: validated.raster,
+                        transientDeviceFocus: photo.transientDeviceFocus, exif: orientation.rawValue,
+                        captureID: photo.captureID)
+                    let point = selection.point ?? NormalizedImagePoint(x: 0.5, y: 0.5)
+                    guard validated.raster.value(at: point) != nil else {
+                        notes.append("nativeRejected=focus sample unavailable")
+                        return nil
+                    }
+                    do {
+                        // Global coverage alone is not enough: the same focus
+                        // neighborhood used for rendering must be reliable too.
+                        _ = try DepthMath.makePlan(depth: validated.raster, focus: point,
+                            isPerson: false, aperture: photo.options.aperture)
+                    } catch DepthAnalysisError.insufficientSeparation {
+                        // A valid flat scene is not a missing-depth failure.
+                    } catch {
+                        notes.append("nativeRejected=focus neighborhood or depth unavailable")
+                        return nil
+                    }
+                    nativeSelection = selection
+                    return validated.raster
+                }
+                if let native {
+                    depth = native
+                    depthSource = .native
+                } else {
+                    let estimated = try depthEstimator?(original) ?? monocularEstimator.estimate(image: original)
+                    depth = try PhotoDepthData(raster: estimated, source: .estimated).raster
+                    depthSource = .estimated
+                }
+                notes += ["depthSource=\(depthSource.rawValue)", depthStatistics(depth)]
+                guard abs((CGFloat(depth.width)/CGFloat(depth.height)) /
+                          (original.extent.width/original.extent.height) - 1) <= 0.02 else {
+                    throw DepthAnalysisError.alignmentMismatch
+                }
+                let selection = nativeSelection ?? choosePlane(original: original, depth: depth,
+                    transientDeviceFocus: photo.transientDeviceFocus, exif: orientation.rawValue,
+                    captureID: photo.captureID)
+                let focus = selection.point ?? NormalizedImagePoint(x: 0.5, y: 0.5)
+                guard depth.value(at: focus) != nil else { throw DepthAnalysisError.focusUnavailable }
+                let inverse: UInt32 = exif == 6 ? 8 : (exif == 8 ? 6 : exif)
+                let stored = try PhotoDepthData(raster: depth.oriented(exif: inverse), source: depthSource)
+                let initial = PhotoEditRecipe(aperture: photo.options.aperture,
+                    sensorFocus: photo.transientDeviceFocus ?? focus.oriented(exif: inverse))
+                let rendered: DepthBlurOutput
+                do {
+                    rendered = try ComputationalDepthRenderer(context: context, colorSpace: colorSpace)
+                        .render(original: original, depth: depth, focus: focus, aperture: initial.aperture)
+                } catch DepthAnalysisError.insufficientSeparation {
+                    // A flat scene remains editable; inventing separation would
+                    // turn a depth effect into an arbitrary full-frame blur.
+                    rendered = DepthBlurOutput(image: original,
+                        amountMask: CIImage(color: .black).cropped(to: original.extent),
+                        notes: "effect=flat scene; original preserved")
+                }
+                guard let cg = context.createCGImage(rendered.image, from: original.extent,
+                    format: .RGBA8, colorSpace: colorSpace) else { throw CameraError.captureFailed }
+                output = CIImage(cgImage: cg)
+                let measurement = try measure(original: original, result: output, mask: rendered.amountMask)
+                outcome = measurement.hasVisibleChange ? .applied : .weakEffect
+                notes += [rendered.notes, "selection=\(selection.source)",
+                          String(format: "meanChange=%.4f/255", measurement.meanAbsoluteChange * 255)]
+                diagnostic = try? previewJPEG(rendered.amountMask, maximum: 1200)
+                attachment = try stored.encoded()
+                recipe = initial
+            } catch {
+                output = original
+                attachment = nil
+                recipe = nil
+                diagnostic = nil
+                switch error {
+                case DepthAnalysisError.focusUnavailable: outcome = .focusUnavailable
+                case DepthAnalysisError.alignmentMismatch: outcome = .alignmentMismatch
+                default: outcome = .renderFailed
+                }
+                notes += ["fallback=ordinary photo", "processingIssue=\(error.localizedDescription)"]
+                TestLog.shared.record("computational failed \(TestLog.errorDescription(error))",
+                    category: "processor", captureID: photo.captureID)
+            }
+        }
+        guard let cg = context.createCGImage(output, from: original.extent, format: .RGBA8,
+                                             colorSpace: colorSpace) else { throw CameraError.captureFailed }
+        let jpeg = try encodeJPEG(cg, quality: 0.95)
+        let preview = try previewJPEG(CIImage(cgImage: cg))
+        let before = outcome.canCompare ? try previewJPEG(original) : preview
+        notes += ["outcome=\(outcome.rawValue)", "cachedDepth=\(attachment != nil)",
+                  String(format: "processingSeconds=%.3f", ProcessInfo.processInfo.systemUptime-started)]
+        let text = notes.joined(separator: "\n")
+        TestLog.shared.record(text, category: "processor", captureID: photo.captureID)
+        return ProcessedPhoto(jpegData: jpeg, previewData: preview, originalPreviewData: before,
+            diagnosticMaskData: diagnostic, diagnosticText: text, outcome: outcome,
+            aperture: photo.options.aperture, pixelWidth: cg.width, pixelHeight: cg.height,
+            captureID: photo.captureID, renderer: .computational, usedAppleMetadataCompatibility: false,
+            diagnosticImageIsDifference: false, editRecipe: recipe, editDepthData: attachment)
     }
 
     /// 点按优先；未点按时，用人脸中心的深度或画面中心深度。Vision 只检测框，不做人像替换。

@@ -197,7 +197,7 @@ final class PhotoEditorViewController: UIViewController {
                 refreshState()
                 do {
                     let result = try await renderer.render(sourceData: document.sourceData,
-                                                           recipe: request.recipe, maximumDimension: 1600)
+                        recipe: request.recipe, maximumDimension: 1600, depthData: document.depthData)
                     guard let image = UIImage(data: result.jpegData) else { throw CameraError.captureFailed }
                     if session.complete(request, succeeded: true) {
                         renderedImage = image
@@ -306,7 +306,8 @@ final class PhotoEditorViewController: UIViewController {
         Task {
             defer { isExporting = false; refreshState() }
             do {
-                let result = try await renderer.render(sourceData: document.sourceData, recipe: recipe)
+                let result = try await renderer.render(sourceData: document.sourceData, recipe: recipe,
+                                                       depthData: document.depthData)
                 let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
                 guard status == .authorized || status == .limited else { throw CameraError.photoLibraryDenied }
                 try await PHPhotoLibrary.shared().performChanges {

@@ -8,10 +8,17 @@
 import Foundation
 
 enum DepthRenderingMethod: String, Sendable {
+    case computational
     case apple
     case legacy
 
-    var title: String { self == .apple ? "苹果景深" : "旧版景深" }
+    var title: String {
+        switch self {
+        case .computational: return "智能景深"
+        case .apple: return "苹果景深"
+        case .legacy: return "旧版景深"
+        }
+    }
 }
 
 struct DepthOptions: Sendable, Equatable {

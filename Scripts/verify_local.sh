@@ -19,6 +19,7 @@ swiftc -swift-version 5 TestCamer/CameraLensPolicy.swift Tests/CameraLensPolicyT
 "$TMP/camera-lens-policy-tests"
 swiftc -swift-version 5 TestCamer/CameraZoomPolicy.swift Tests/CameraZoomPolicyTests.swift -o "$TMP/camera-zoom-policy-tests"
 "$TMP/camera-zoom-policy-tests"
+bash Scripts/verify_main_camera_capture.sh
 swiftc -O -swift-version 5 TestCamer/DepthCapturePolicy.swift TestCamer/DepthMath.swift Tests/DepthMathTests.swift -o "$TMP/depth-math-tests"
 "$TMP/depth-math-tests"
 echo "== Persistent TestLog checks =="

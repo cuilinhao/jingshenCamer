@@ -26,7 +26,7 @@ enum PhotoEditingRenderingError: Error, LocalizedError {
 }
 
 /// Owns Core Image work on one background queue. Every render starts from the
-/// immutable capture container, including its native depth and optional mattes.
+/// immutable capture container plus cached depth, or legacy native auxiliary data.
 /// No previous rendered result is cached or reused as an input image.
 final class PhotoEditingRenderer: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.testcamer.photo-editing", qos: .userInitiated)
@@ -34,12 +34,16 @@ final class PhotoEditingRenderer: @unchecked Sendable {
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
 
     func render(sourceData: Data, recipe: PhotoEditRecipe,
-                maximumDimension: Int? = nil) async throws -> PhotoEditingRenderResult {
+                maximumDimension: Int? = nil, depthData: Data? = nil) async throws -> PhotoEditingRenderResult {
         guard recipe.isValid else { throw PhotoEditingRenderingError.invalidRecipe }
         guard maximumDimension.map({ $0 > 0 }) ?? true else {
             throw PhotoEditingRenderingError.invalidPreviewSize
         }
         return try await perform { [self] in
+            if let depthData {
+                return try renderCachedDepth(sourceData: sourceData, depthData: depthData,
+                    recipe: recipe, maximumDimension: maximumDimension)
+            }
             try validateFocus(sourceData: sourceData, sensorFocus: recipe.sensorFocus)
             let result = try AppleDepthRenderer(context: context).render(
                 photoData: sourceData, aperture: recipe.aperture, sensorFocus: recipe.sensorFocus)
@@ -48,6 +52,36 @@ final class PhotoEditingRenderer: @unchecked Sendable {
             return PhotoEditingRenderResult(jpegData: output.data, pixelWidth: output.width,
                 pixelHeight: output.height, usedMetadataCompatibility: result.usedMetadataCompatibility)
         }
+    }
+
+    private func renderCachedDepth(sourceData: Data, depthData: Data, recipe: PhotoEditRecipe,
+                                   maximumDimension: Int?) throws -> PhotoEditingRenderResult {
+        let stored = try PhotoDepthData.decode(depthData)
+        guard let source = CGImageSourceCreateWithData(sourceData as CFData, nil),
+              let raw = CIImage(data: sourceData, options: [.applyOrientationProperty: false]) else {
+            throw PhotoEditingRenderingError.invalidImage
+        }
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] ?? [:]
+        let exif = (properties[kCGImagePropertyOrientation as String] as? NSNumber)?.uint32Value ?? 1
+        let orientation = CGImagePropertyOrientation(rawValue: exif) ?? .up
+        let oriented = raw.oriented(orientation)
+        let original = oriented.transformed(by: CGAffineTransform(
+            translationX: -oriented.extent.minX, y: -oriented.extent.minY))
+        let depth = stored.raster.oriented(exif: orientation.rawValue)
+        let sensorFocus = recipe.sensorFocus ?? NormalizedImagePoint(x: 0.5, y: 0.5)
+        let focus = sensorFocus.oriented(exif: orientation.rawValue)
+        guard depth.value(at: focus) != nil else { throw PhotoEditingRenderingError.focusUnavailable }
+        let image: CIImage
+        do {
+            image = try ComputationalDepthRenderer(context: context, colorSpace: colorSpace)
+                .render(original: original, depth: depth, focus: focus, aperture: recipe.aperture).image
+        } catch DepthAnalysisError.insufficientSeparation {
+            image = original
+        }
+        let output = try encode(image, maximumDimension: maximumDimension,
+                                quality: maximumDimension == nil ? 0.95 : 0.9)
+        return PhotoEditingRenderResult(jpegData: output.data, pixelWidth: output.width,
+            pixelHeight: output.height, usedMetadataCompatibility: false)
     }
 
     /// A globally valid depth map can still contain holes. Never claim that a

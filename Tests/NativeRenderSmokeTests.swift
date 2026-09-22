@@ -169,9 +169,9 @@ struct NativeRenderSmokeTests {
         let noContainer = try await processor.process(CapturedPhoto(data: png, depthRequested: true,
             hasDepthData: true, nativeDepth: snapshot, options: DepthOptions(enabled: true, aperture: 1.4),
             transientDeviceFocus: NormalizedImagePoint(x: 0.5, y: 0.5), captureSummary: "missing native auxiliary container"),
-            includeLegacyComparison: true)
+            renderer: .apple, includeLegacyComparison: true)
         expect(noContainer.outcome == .renderFailed,
-               "Default renderer never silently substitutes legacy blur when Apple input is missing")
+               "Explicit Apple renderer never silently substitutes other blur when native input is missing")
         expect(noContainer.diagnosticMaskData == nil,
                "Failed Apple rendering never publishes a fabricated blur mask")
         expect(noContainer.legacyComparison?.outcome == .applied,
@@ -193,7 +193,7 @@ struct NativeRenderSmokeTests {
 
         let missing = try await processor.process(CapturedPhoto(data: png, depthRequested: true,
             hasDepthData: false, nativeDepth: nil, options: DepthOptions(enabled: true, aperture: 1.4),
-            transientDeviceFocus: nil, captureSummary: "synthetic missing-depth case"))
+            transientDeviceFocus: nil, captureSummary: "synthetic missing-depth case"), renderer: .apple)
         expect(missing.outcome == .missingDepth, "Missing depth reports ordinary-photo fallback")
         expect(missing.diagnosticMaskData == nil, "Missing depth does not fabricate a mask")
         expect(noContainer.jpegData == missing.jpegData,
@@ -218,7 +218,7 @@ struct NativeRenderSmokeTests {
         let applePhoto = CapturedPhoto(data: appleInput, depthRequested: true, hasDepthData: true,
             nativeDepth: appleSnapshot, options: DepthOptions(enabled: true, aperture: 1.4),
             transientDeviceFocus: .init(x: 0.22, y: 0.27), captureSummary: "unblurred same-frame Apple fixture")
-        let appleResult = try await processor.process(applePhoto, includeLegacyComparison: true)
+        let appleResult = try await processor.process(applePhoto, renderer: .apple, includeLegacyComparison: true)
         expect(appleResult.outcome == .applied, "Default Apple pipeline produces measured changes from native auxiliary data")
         expect(appleResult.legacyComparison?.outcome == .applied, "Same-frame legacy renderer runs independently")
         expect(appleResult.legacyComparison?.previewData != appleResult.previewData,

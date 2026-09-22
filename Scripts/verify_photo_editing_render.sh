@@ -17,6 +17,7 @@ trap 'rm -rf "$BUILD_DIR"' EXIT
 cd "$ROOT"
 xcrun --sdk macosx swiftc -O -swift-version 5 -target "$(uname -m)-apple-macosx14.0" \
   TestCamer/TestLog.swift TestCamer/DepthCapturePolicy.swift TestCamer/DepthMath.swift \
+  TestCamer/PhotoDepthData.swift TestCamer/MonocularDepthEstimator.swift TestCamer/ComputationalDepthRenderer.swift \
   TestCamer/PhotoEditingModels.swift TestCamer/NativeDepthSnapshot.swift TestCamer/CaptureModels.swift \
   TestCamer/AppleDepthRenderer.swift TestCamer/PhotoEditingRenderer.swift \
   TestCamer/PortraitSubjectMask.swift TestCamer/DepthBlurRenderer.swift TestCamer/DepthPhotoProcessor.swift \

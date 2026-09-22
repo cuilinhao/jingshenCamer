@@ -95,7 +95,7 @@ struct PhotoEditingRenderTests {
             let capture = CapturedPhoto(data: source, depthRequested: true, hasDepthData: true,
                 nativeDepth: nativeDepth, options: DepthOptions(enabled: true, aperture: 1.4),
                 transientDeviceFocus: nearRecipe.sensorFocus, captureSummary: "editing fixture")
-            let processed = try await DepthPhotoProcessor().process(capture)
+            let processed = try await DepthPhotoProcessor().process(capture, renderer: .apple)
             expect(processed.outcome.canCompare, "EXIF \(orientation): capture produced a usable depth image")
             expect(processed.editRecipe?.aperture == 1.4
                    && abs((processed.editRecipe?.sensorFocus?.x ?? -1)-0.22) < 1e-12
@@ -121,13 +121,13 @@ struct PhotoEditingRenderTests {
         let invalidCapture = try await DepthPhotoProcessor().process(CapturedPhoto(
             data: depthHole, depthRequested: true, hasDepthData: true, nativeDepth: holeDepth,
             options: DepthOptions(enabled: true, aperture: 1.4), transientDeviceFocus: nearRecipe.sensorFocus,
-            captureSummary: "selected depth hole"))
+            captureSummary: "selected depth hole"), renderer: .apple)
         expect(invalidCapture.outcome == .focusUnavailable && invalidCapture.editRecipe == nil,
                "capture cannot offer an editable recipe for a focus point without depth")
         let ordinary = try await DepthPhotoProcessor().process(CapturedPhoto(
             data: noDepth, depthRequested: true, hasDepthData: false, nativeDepth: nil,
             options: DepthOptions(enabled: true, aperture: 1.4), transientDeviceFocus: nil,
-            captureSummary: "ordinary photo"))
+            captureSummary: "ordinary photo"), renderer: .apple)
         expect(ordinary.editRecipe == nil, "ordinary photos do not advertise depth editing")
         await rejects("RGB-only input must fail instead of returning an ordinary photo") {
             _ = try await renderer.render(sourceData: noDepth, recipe: nearRecipe)

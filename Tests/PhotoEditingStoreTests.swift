@@ -239,6 +239,172 @@ struct PhotoEditingStoreTests {
         expect(intact.sourceData == photo.sourceData, "deleting same-photo staging cannot delete committed original")
     }
 
+    static func withDepth(_ photo: EditablePhotoDocument, _ depth: Data?) -> EditablePhotoDocument {
+        EditablePhotoDocument(id: photo.id, createdAt: photo.createdAt, updatedAt: photo.updatedAt,
+                              sourceData: photo.sourceData, initialRecipe: photo.initialRecipe,
+                              recipe: photo.recipe, previewData: photo.previewData, depthData: depth)
+    }
+
+    static func depthBytes(source: PhotoDepthSource = .estimated) throws -> Data {
+        try PhotoDepthData(raster: DepthRaster(width: 3, height: 2, values: [1, 2, 3, 4, 5, 6]),
+                           source: source).encoded()
+    }
+
+    static func manifestURL(in package: URL) throws -> URL {
+        let pointer = try JSONSerialization.jsonObject(with: Data(contentsOf: package.appendingPathComponent("current.json"))) as! [String: Any]
+        return package.appendingPathComponent("revisions").appendingPathComponent(pointer["revision"] as! String)
+            .appendingPathComponent("manifest.json")
+    }
+
+    static func depthSnapshotRoundTripAndValidation() async throws {
+        for source in [PhotoDepthSource.native, .estimated] {
+            let input: [Float] = [1.125, .nan, .infinity, -1, 0, 5.25]
+            let snapshot = try PhotoDepthData(raster: DepthRaster(width: 3, height: 2, values: input), source: source)
+            expect(snapshot.raster.values == [1.125, 0, 0, 0, 0, 5.25],
+                   "depth initializer normalizes invalid and nonpositive samples for \(source)")
+            let restored = try PhotoDepthData.decode(snapshot.encoded())
+            expect(restored.source == source && restored.raster.width == 3 && restored.raster.height == 2,
+                   "depth round trip preserves provenance and non-square sensor geometry for \(source)")
+            expect(restored.raster.values == [1.125, 0, 0, 0, 0, 5.25],
+                   "depth round trip preserves top-left row order and floating point disparities for \(source)")
+        }
+        let extreme: [Float] = [.leastNonzeroMagnitude, .greatestFiniteMagnitude, 3.1415927, 0.125]
+        let exact = try PhotoDepthData.decode(PhotoDepthData(raster: DepthRaster(width: 2, height: 2, values: extreme), source: .native).encoded())
+        expect(exact.raster.values.map(\.bitPattern) == extreme.map(\.bitPattern), "depth payload preserves every finite positive Float32 bit pattern")
+        let boundary = try PhotoDepthData(raster: DepthRaster(width: 2, height: 2, values: [2, .nan, -2, 0]), source: .estimated)
+        expect(boundary.raster.values == [2, 0, 0, 0], "exactly 25 percent valid depth remains cacheable")
+        let flat = try PhotoDepthData(raster: DepthRaster(width: 3, height: 2, values: Array(repeating: 2, count: 6)), source: .estimated)
+        expect(try PhotoDepthData.decode(flat.encoded()).raster.values == Array(repeating: 2, count: 6),
+               "flat scenes retain their depth attachment for later editing")
+        let single = try PhotoDepthData(raster: DepthRaster(width: 1, height: 1, values: [2]), source: .native)
+        expect(try PhotoDepthData.decode(single.encoded()).raster.values == [2], "one-pixel positive depth satisfies the documented dimensions")
+        await rejects("less than 25 percent depth coverage is rejected") {
+            _ = try PhotoDepthData(raster: DepthRaster(width: 3, height: 2, values: [2, 0, 0, 0, 0, 0]), source: .estimated)
+        }
+        await rejects("all-invalid depth is rejected") {
+            _ = try PhotoDepthData(raster: DepthRaster(width: 2, height: 2, values: [.nan, -.infinity, -1, 0]), source: .native)
+        }
+        await rejects("unrecognized depth bytes are rejected") { _ = try PhotoDepthData.decode(Data([1, 2, 3])) }
+        let valid = try depthBytes()
+        await rejects("truncated float payload is rejected") { _ = try PhotoDepthData.decode(valid.dropLast()) }
+        await rejects("trailing depth bytes are rejected") { _ = try PhotoDepthData.decode(valid + Data([0])) }
+
+        // Version 1 wire fixture: TCDEPTH\0, UInt16 version, source/coordinate bytes,
+        // little-endian UInt32 width, height and sample count, then Float32 values.
+        let fixture = Data([84, 67, 68, 69, 80, 84, 72, 0, 1, 0, 0, 0,
+                            2, 0, 0, 0, 2, 0, 0, 0, 4, 0, 0, 0,
+                            0, 0, 0, 64, 0, 0, 128, 63, 0, 0, 128, 64, 0, 0, 64, 64])
+        let fixtureDepth = try PhotoDepthData.decode(fixture)
+        expect(fixtureDepth.source == .native && fixtureDepth.raster.values == [2, 1, 4, 3],
+               "independent version 1 fixture decodes little-endian floats")
+        for (offset, bytes, name) in [
+            (8, [UInt8(2), 0], "future depth version"),
+            (10, [UInt8(255)], "unknown depth provenance"),
+            (11, [UInt8(1)], "unsupported depth coordinate convention"),
+            (12, [UInt8(0), 0, 0, 0], "zero depth width"),
+            (12, [UInt8(1), 16, 0, 0], "oversize depth width"),
+            (16, [UInt8(255), 255, 255, 255], "overflowing depth height"),
+            (20, [UInt8(255), 255, 255, 255], "overflowing sample count")
+        ] {
+            var corrupted = fixture
+            corrupted.replaceSubrange(offset..<(offset + bytes.count), with: bytes)
+            await rejects("\(name) is rejected before allocating samples") { _ = try PhotoDepthData.decode(corrupted) }
+        }
+        var invalidFloats = fixture
+        invalidFloats.replaceSubrange(28..<40, with: [UInt8](repeating: 255, count: 12))
+        expect(try PhotoDepthData.decode(invalidFloats).raster.values == [2, 0, 0, 0],
+               "decoder normalizes nonfinite floats while enforcing coverage")
+    }
+
+    static func depthAttachmentPersistenceAndImmutability() async throws {
+        let root = try temporaryDirectory(); defer { try? fm.removeItem(at: root) }
+        let store = EditablePhotoStore(rootDirectory: root)
+        let original = withDepth(document(), try depthBytes())
+        try await store.save(original)
+        let package = root.appendingPathComponent(original.id.uuidString)
+        let depthURL = package.appendingPathComponent("depth.bin")
+        let written = try Data(contentsOf: depthURL)
+        let fileDate = try depthURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+        expect(written == original.depthData, "initial transaction writes exact immutable depth sidecar")
+        var loaded = try await EditablePhotoStore(rootDirectory: root).load(id: original.id)
+        expect(loaded.depthData == original.depthData, "restart restores exact depth attachment")
+        loaded.recipe = .init(aperture: 8, sensorFocus: .init(x: 0.2, y: 0.1))
+        loaded.updatedAt = Date(timeIntervalSince1970: 1_790_000_002)
+        loaded.previewData = Data([1, 2, 3])
+        try await store.save(loaded)
+        expect(try Data(contentsOf: depthURL) == written, "editing preserves depth bytes")
+        expect(try depthURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate == fileDate,
+               "editing never rewrites the immutable depth sidecar")
+        let reopened = try await store.load(id: original.id)
+        expect(reopened.depthData == original.depthData && reopened.recipe == loaded.recipe && reopened.previewData == loaded.previewData,
+               "committed edit reopens with its original depth and matching recipe/preview")
+        let replaced = withDepth(loaded, try depthBytes(source: .native))
+        await rejects("save refuses replacement of depth provenance or pixels") { try await store.save(replaced) }
+        await rejects("save refuses removal of original depth") { try await store.save(withDepth(loaded, nil)) }
+        let invalid = withDepth(document(), Data([0, 1, 2]))
+        await rejects("invalid depth is rejected before creating a package") { try await store.save(invalid) }
+        expect(!fm.fileExists(atPath: root.appendingPathComponent(invalid.id.uuidString).path),
+               "rejected initial depth leaves no incomplete document")
+        let legacy = document()
+        try await store.save(legacy)
+        await rejects("depth cannot be attached later to an immutable legacy original") {
+            try await store.save(withDepth(legacy, original.depthData))
+        }
+    }
+
+    static func damagedDepthAttachmentsAreReported() async throws {
+        let root = try temporaryDirectory(); defer { try? fm.removeItem(at: root) }
+        let store = EditablePhotoStore(rootDirectory: root)
+        let missing = withDepth(document(), try depthBytes())
+        let tampered = withDepth(document(), try depthBytes())
+        let noHash = withDepth(document(), try depthBytes())
+        for photo in [missing, tampered, noHash] { try await store.save(photo) }
+        try fm.removeItem(at: root.appendingPathComponent(missing.id.uuidString).appendingPathComponent("depth.bin"))
+        await rejects("missing depth cannot reopen") { _ = try await store.load(id: missing.id) }
+        await rejects("save cannot silently repair a missing original depth") { try await store.save(missing) }
+        let listing = try await store.list()
+        expect(listing.first(where: { $0.id == missing.id })?.loadErrorDescription != nil,
+               "library surfaces a missing depth sidecar without hiding the entry")
+        let tamperedURL = root.appendingPathComponent(tampered.id.uuidString).appendingPathComponent("depth.bin")
+        try depthBytes(source: .native).write(to: tamperedURL)
+        await rejects("valid but substituted depth fails its manifest checksum") { _ = try await store.load(id: tampered.id) }
+        await rejects("save cannot overwrite a checksum failure") { try await store.save(tampered) }
+        let manifest = try manifestURL(in: root.appendingPathComponent(noHash.id.uuidString))
+        var metadata = try JSONSerialization.jsonObject(with: Data(contentsOf: manifest)) as! [String: Any]
+        expect(metadata["schemaVersion"] as? Int == 2 && metadata["depthSHA256"] as? String != nil,
+               "depth documents record schema 2 and an explicit attachment checksum")
+        metadata.removeValue(forKey: "depthSHA256")
+        try JSONSerialization.data(withJSONObject: metadata).write(to: manifest)
+        await rejects("schema 2 cannot omit the immutable depth checksum") { _ = try await store.load(id: noHash.id) }
+        let damaged = try await store.list()
+        expect(damaged.first(where: { $0.id == noHash.id })?.loadErrorDescription != nil,
+               "library surfaces missing attachment metadata")
+    }
+
+    static func legacySchemaRemainsReadable() async throws {
+        let root = try temporaryDirectory(); defer { try? fm.removeItem(at: root) }
+        let store = EditablePhotoStore(rootDirectory: root)
+        let photo = document()
+        try await store.save(photo)
+        let package = root.appendingPathComponent(photo.id.uuidString)
+        let manifest = try manifestURL(in: package)
+        var metadata = try JSONSerialization.jsonObject(with: Data(contentsOf: manifest)) as! [String: Any]
+        metadata["schemaVersion"] = 1
+        metadata.removeValue(forKey: "depthSHA256")
+        try JSONSerialization.data(withJSONObject: metadata).write(to: manifest)
+        let pointerURL = package.appendingPathComponent("current.json")
+        var pointer = try JSONSerialization.jsonObject(with: Data(contentsOf: pointerURL)) as! [String: Any]
+        pointer["schemaVersion"] = 1
+        try JSONSerialization.data(withJSONObject: pointer).write(to: pointerURL)
+        var restored = try await EditablePhotoStore(rootDirectory: root).load(id: photo.id)
+        expect(restored.depthData == nil && restored.sourceData == photo.sourceData && restored.recipe == photo.recipe,
+               "schema 1 manifests without attachment fields retain the legacy editing path")
+        restored.recipe = .init(aperture: 11, sensorFocus: nil)
+        try await store.save(restored)
+        let edited = try await store.load(id: restored.id)
+        expect(edited.depthData == nil && edited.recipe.aperture == 11, "legacy documents remain editable without creating depth")
+    }
+
     static func main() async {
         do {
             try await roundTripAndUpdate()
@@ -249,6 +415,10 @@ struct PhotoEditingStoreTests {
             try await detectsChangedSourceAndUnknownSchema()
             try await staleInitialWriteRecovery()
             try await failedStagingCleanupIsVisibleAndDeletable()
+            try await depthSnapshotRoundTripAndValidation()
+            try await depthAttachmentPersistenceAndImmutability()
+            try await damagedDepthAttachmentsAreReported()
+            try await legacySchemaRemainsReadable()
         } catch { failures += 1; print("FAIL: unexpected error: \(error)") }
         print("Photo editing store: \(checks) checks, \(failures) failures")
         if failures != 0 { exit(1) }

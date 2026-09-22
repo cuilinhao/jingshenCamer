@@ -318,8 +318,10 @@ private extension ViewController {
             do {
                 let payload = try await camera.capturePhoto(flashMode: flashMode, options: options,
                                                            rotationAngle: rotation, mirrored: mirrored)
-                statusLabel.text = payload.depthRequested ? "正在生成苹果景深与同帧对比…" : "正在生成照片…"
-                let result = try await processor.process(payload, includeLegacyComparison: true)
+                statusLabel.text = options.enabled
+                    ? (payload.prefersAppleDepth && payload.hasDepthData ? "正在生成苹果景深…" : "正在生成智能景深…")
+                    : "正在生成照片…"
+                let result = try await processor.process(payload)
                 guard let image = UIImage(data: result.previewData) else { throw CameraError.captureFailed }
                 TestLog.shared.record("result displayed outcome=\(result.outcome.rawValue), dimensions=\(result.pixelWidth)x\(result.pixelHeight)", category: "ui", captureID: result.captureID)
                 processedPhoto = result
@@ -331,7 +333,7 @@ private extension ViewController {
                 showCapturedImage(image)
                 if let recipe = result.editRecipe {
                     let document = EditablePhotoDocument(sourceData: payload.data, initialRecipe: recipe,
-                        recipe: recipe, previewData: result.previewData)
+                        recipe: recipe, previewData: result.previewData, depthData: result.editDepthData)
                     var saveError: String?
                     do { try await editableStore.save(document) }
                     catch { saveError = error.localizedDescription }
@@ -896,7 +898,7 @@ private extension ViewController {
         depthPanel.clipsToBounds = true
         view.addSubview(depthPanel)
 
-        depthTitleLabel.text = "苹果景深 · v3"
+        depthTitleLabel.text = "智能景深"
         depthTitleLabel.font = .systemFont(ofSize: 16, weight: .semibold)
         depthTitleLabel.textColor = .white
         depthHintLabel.font = .systemFont(ofSize: 12)
@@ -1010,20 +1012,23 @@ private extension ViewController {
 
     func updateDepthPanel() {
         let supported = cameraState?.depthSupported == true
-        let active = supported && wantsDepth
+        let active = wantsDepth
         depthSwitch.setOn(active, animated: false)
-        depthTitleLabel.text = supported ? "苹果景深 · v3" : "普通拍照 · v3"
+        depthTitleLabel.text = active ? "智能景深" : "普通拍照"
         if let state = cameraState {
+            let isMain = !state.isFront && state.rearLensOptions.first {
+                $0.id == state.selectedRearLensID
+            }?.kind == .wide
+            if active && isMain && supported { depthTitleLabel.text = "苹果景深" }
             let zoom = String(format: "%.1f×", Double(state.zoomFactor))
                 .replacingOccurrences(of: ".0×", with: "×")
             let fieldOfView = abs(state.zoomFactor - 1) < 0.001 ? "原生视角" : "数码变焦 \(zoom)"
             let lensHint = "\(state.activeLensName) · \(fieldOfView)"
-            if !supported {
-                depthHintLabel.text = "\(lensHint)\n当前镜头配置仅支持普通拍照"
-            } else {
-                let captureHint = active ? "景深可用 · 拍完可换焦、调光圈" : "景深可用 · 当前已关闭"
-                depthHintLabel.text = "\(lensHint)\n\(captureHint)"
-            }
+            let sourceHint = supported
+                ? (isMain ? "主摄成像 · 苹果原生景深优先" : "原生深度 · 智能渲染")
+                : (isMain ? "主摄原生深度不可用 · 本机估计" : "本机估计深度")
+            let captureHint = active ? "\(sourceHint) · 拍完可换焦、调虚化" : "景深已关闭"
+            depthHintLabel.text = "\(lensHint)\n\(captureHint)"
         } else {
             depthHintLabel.text = "正在检测当前镜头的景深能力…"
         }
@@ -1033,7 +1038,7 @@ private extension ViewController {
         apertureSlider.alpha = active ? 1 : 0.35
         let available = cameraState?.isRunning == true && capturedImage == nil && !isCapturing
             && !isSwitching && !isStarting && !isExportingLog
-        depthSwitch.isEnabled = supported && available
+        depthSwitch.isEnabled = available
         apertureSlider.isEnabled = active && available
     }
 

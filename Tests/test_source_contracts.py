@@ -20,8 +20,8 @@ class SourceContracts(unittest.TestCase):
         self.assertNotRegex(src, r'CIKernel\s*\(|CIColorKernel\s*\(')
         ui = self.read('ViewController.swift')
         self.assertIn('updateDepthPanel() // 仅更新下一次拍照参数；不渲染预览。', ui)
-    # 后置已改为严格物理镜头。候选过滤、精确 ID 选择和变焦范围由
-    # CameraLensPolicyTests / CameraZoomPolicyTests 执行行为检查。
+    # 后置固定 RGB 物理镜头；主摄允许原生深度辅助。
+    # 候选过滤、精确 ID 与变焦由 Lens / Zoom / MainCameraCapturePolicyTests 检查。
     def test_disparity_uses_float_and_row_stride(self):
         c = self.read('NativeDepthSnapshot.swift')
         for token in ['kCVPixelFormatType_DisparityFloat32', 'CVPixelBufferGetBytesPerRow',
@@ -36,13 +36,8 @@ class SourceContracts(unittest.TestCase):
         self.assertIn('fallback=ordinary photo', p)
     # 本机文档持久化现已由真实 PhotoEditingStoreTests 覆盖；
     # JPEG 无深度/焦点附件由真实 PhotoEditingRenderTests 验证。
-    def test_no_external_depth_model_fallback(self):
-        src = '\n'.join(p.read_text() for p in APP.glob('*.swift'))
-        # Apple 人物 mask 仅保护真实深度渲染中的主体；无深度回退由原生管线测试验证。
-        self.assertNotRegex(src, r'MLModel\(')
-        self.assertIn('VNDetectFaceRectanglesRequest', src)
-        for p in APP.rglob('*'):
-            self.assertNotIn(p.suffix, ('.m', '.mm', '.cpp', '.metal', '.mlmodel', '.mlpackage'))
+    # 三镜头智能景深现允许离线 Core ML 模型。实际推理与无原生深度回退由
+    # MonocularDepthEstimatorTests / ComputationalPipelineTests 验证。
     def test_terminal_callback_and_identity_guard(self):
         c = self.read('CameraManager.swift')
         for t in ['didFinishCaptureFor', 'resolvedSettings.uniqueID', 'captureTimeout', 'pending.id == id']:

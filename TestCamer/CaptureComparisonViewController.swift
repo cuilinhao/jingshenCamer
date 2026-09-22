@@ -11,7 +11,7 @@ final class CaptureComparisonViewController: UIViewController {
     init(photo: ProcessedPhoto) {
         self.photo = photo
         selector = UISegmentedControl(items: photo.legacyComparison != nil
-            ? ["原图", "苹果初始", "旧版"] : ["原图", "苹果初始"])
+            ? ["原图", "初始效果", "旧版"] : ["原图", "初始效果"])
         super.init(nibName: nil, bundle: nil)
     }
     required init?(coder: NSCoder) { nil }

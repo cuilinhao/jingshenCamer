@@ -11,7 +11,7 @@ enum EditablePhotoStoreError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidDocument: return "照片的光圈、焦点、日期或图像数据无效，未保存这次修改。"
-        case .immutableOriginal: return "原始照片和初始效果不能被覆盖，之前保存的版本未改变。"
+        case .immutableOriginal: return "原始照片、深度和初始效果不能被覆盖，之前保存的版本未改变。"
         case .notFound: return "找不到这张本机可编辑照片，可能已被删除。"
         case .damaged(let reason): return "这张可编辑照片的数据损坏或版本不受支持：\(reason)"
         case .cleanupFailed(let cause, let cleanup):
@@ -50,6 +50,7 @@ actor EditablePhotoStore {
         let recipe: PhotoEditRecipe
         let sourceSHA256: String
         let previewSHA256: String
+        let depthSHA256: String?
     }
 
     private let rootDirectory: URL
@@ -61,15 +62,20 @@ actor EditablePhotoStore {
         self.rootDirectory = rootDirectory ?? support.appendingPathComponent("TestCamer/EditablePhotos", isDirectory: true)
     }
 
-    /// 唯一提交点为 current.json 的原子替换。原图永不改写；旧版本在下一次保存前清理。
+    /// 唯一提交点为 current.json 的原子替换。原图和深度永不改写；旧版本在下一次保存前清理。
     /// 中途退出最多留下未引用的版本，不会让参数和预览分别来自两次编辑。
     func save(_ document: EditablePhotoDocument) throws {
         guard Self.isValid(document) else { throw EditablePhotoStoreError.invalidDocument }
+        if let depth = document.depthData {
+            do { _ = try PhotoDepthData.decode(depth) }
+            catch { throw EditablePhotoStoreError.invalidDocument }
+        }
         try files.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
         let destination = packageURL(document.id)
         if files.fileExists(atPath: destination.path) {
             let previous = try load(id: document.id)
             guard previous.sourceData == document.sourceData,
+                  previous.depthData == document.depthData,
                   previous.initialRecipe == document.initialRecipe,
                   previous.createdAt == document.createdAt else { throw EditablePhotoStoreError.immutableOriginal }
             let active = try readPointer(at: destination, id: document.id)
@@ -83,6 +89,7 @@ actor EditablePhotoStore {
             do {
                 try files.createDirectory(at: staging, withIntermediateDirectories: false)
                 try document.sourceData.write(to: staging.appendingPathComponent("source.bin"), options: .atomic)
+                try document.depthData?.write(to: staging.appendingPathComponent("depth.bin"), options: .atomic)
                 try writeRevision(document, to: staging)
                 try files.moveItem(at: staging, to: destination)
             } catch { throw removeIncompleteWrite(at: staging, cause: error) }
@@ -100,9 +107,19 @@ actor EditablePhotoStore {
                   Self.digest(preview) == manifest.previewSHA256 else {
                 throw EditablePhotoStoreError.damaged("图像校验失败")
             }
+            let depth: Data?
+            if let attachment = try depthAttachment(at: package, manifest: manifest) {
+                // 文件属性与读取之间仍可能有外部改写；有界读取也防止被替换成巨型文件。
+                let handle = try FileHandle(forReadingFrom: attachment.url)
+                defer { try? handle.close() }
+                let bytes = try handle.read(upToCount: attachment.byteCount + 1) ?? Data()
+                guard Self.digest(bytes) == manifest.depthSHA256 else { throw EditablePhotoStoreError.damaged("深度校验失败") }
+                _ = try PhotoDepthData.decode(bytes)
+                depth = bytes
+            } else { depth = nil }
             let document = EditablePhotoDocument(id: id, createdAt: manifest.createdAt, updatedAt: manifest.updatedAt,
                                                  sourceData: source, initialRecipe: manifest.initialRecipe,
-                                                 recipe: manifest.recipe, previewData: preview)
+                                                 recipe: manifest.recipe, previewData: preview, depthData: depth)
             guard Self.isValid(document) else { throw EditablePhotoStoreError.invalidDocument }
             return document
         } catch { throw EditablePhotoStoreError.damaged(error.localizedDescription) }
@@ -125,6 +142,7 @@ actor EditablePhotoStore {
                       Self.digest(preview) == manifest.previewSHA256 else {
                     throw EditablePhotoStoreError.damaged("缺少原图或预览数据")
                 }
+                _ = try depthAttachment(at: package, manifest: manifest)
                 summaries.append(EditablePhotoSummary(id: id, createdAt: manifest.createdAt, updatedAt: manifest.updatedAt,
                                                        previewURL: previewURL))
             } catch {
@@ -209,12 +227,14 @@ actor EditablePhotoStore {
         do {
             try files.createDirectory(at: revision, withIntermediateDirectories: true)
             try document.previewData.write(to: revision.appendingPathComponent("preview.jpg"), options: .atomic)
-            let manifest = Manifest(schemaVersion: 1, id: document.id, createdAt: document.createdAt,
+            let schemaVersion = document.depthData == nil ? 1 : 2
+            let manifest = Manifest(schemaVersion: schemaVersion, id: document.id, createdAt: document.createdAt,
                                     updatedAt: document.updatedAt, initialRecipe: document.initialRecipe,
                                     recipe: document.recipe, sourceSHA256: Self.digest(document.sourceData),
-                                    previewSHA256: Self.digest(document.previewData))
+                                    previewSHA256: Self.digest(document.previewData),
+                                    depthSHA256: document.depthData.map(Self.digest))
             try JSONEncoder().encode(manifest).write(to: revision.appendingPathComponent("manifest.json"), options: .atomic)
-            let pointer = Pointer(schemaVersion: 1, id: document.id, revision: revisionID)
+            let pointer = Pointer(schemaVersion: schemaVersion, id: document.id, revision: revisionID)
             try JSONEncoder().encode(pointer).write(to: package.appendingPathComponent("current.json"), options: .atomic)
             // 不在提交后做可能失败的工作，避免已保存却向调用方报告失败。
         } catch { throw removeIncompleteWrite(at: revision, cause: error) }
@@ -222,7 +242,7 @@ actor EditablePhotoStore {
 
     private func readPointer(at package: URL, id: UUID) throws -> Pointer {
         let pointer = try JSONDecoder().decode(Pointer.self, from: Data(contentsOf: package.appendingPathComponent("current.json")))
-        guard pointer.schemaVersion == 1, pointer.id == id else { throw EditablePhotoStoreError.damaged("版本或照片标识不匹配") }
+        guard (1...2).contains(pointer.schemaVersion), pointer.id == id else { throw EditablePhotoStoreError.damaged("版本或照片标识不匹配") }
         return pointer
     }
 
@@ -230,10 +250,37 @@ actor EditablePhotoStore {
         let pointer = try readPointer(at: package, id: id)
         let revision = package.appendingPathComponent("revisions").appendingPathComponent(pointer.revision.uuidString)
         let manifest = try JSONDecoder().decode(Manifest.self, from: Data(contentsOf: revision.appendingPathComponent("manifest.json")))
-        guard manifest.schemaVersion == 1, manifest.id == id, manifest.initialRecipe.isValid, manifest.recipe.isValid,
+        guard manifest.schemaVersion == pointer.schemaVersion, manifest.id == id, manifest.initialRecipe.isValid, manifest.recipe.isValid,
               manifest.createdAt.timeIntervalSince1970.isFinite, manifest.updatedAt.timeIntervalSince1970.isFinite,
               manifest.updatedAt >= manifest.createdAt else { throw EditablePhotoStoreError.damaged("编辑参数无效") }
+        switch manifest.schemaVersion {
+        case 1:
+            guard manifest.depthSHA256 == nil else { throw EditablePhotoStoreError.damaged("旧版本包含未支持的深度附件") }
+        case 2:
+            guard let hash = manifest.depthSHA256, hash.count == 64,
+                  hash.allSatisfy({ "0123456789abcdef".contains($0) }) else {
+                throw EditablePhotoStoreError.damaged("缺少有效的深度校验信息")
+            }
+        default: throw EditablePhotoStoreError.damaged("版本不受支持")
+        }
         return (manifest, revision.appendingPathComponent("preview.jpg"))
+    }
+
+    /// 列表只检查附件存在及有界尺寸，打开时再校验完整内容，避免浏览图库读取所有深度。
+    private func depthAttachment(at package: URL, manifest: Manifest) throws -> (url: URL, byteCount: Int)? {
+        let url = package.appendingPathComponent("depth.bin")
+        guard manifest.schemaVersion == 2 else {
+            guard !files.fileExists(atPath: url.path) else { throw EditablePhotoStoreError.damaged("深度附件缺少校验信息") }
+            return nil
+        }
+        let attributes = try files.attributesOfItem(atPath: url.path)
+        let count = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+        guard attributes[.type] as? FileAttributeType == .typeRegular,
+              count >= PhotoDepthData.minimumEncodedByteCount,
+              count <= PhotoDepthData.maximumEncodedByteCount else {
+            throw EditablePhotoStoreError.damaged("深度附件缺失或尺寸无效")
+        }
+        return (url, Int(count))
     }
 
     private func removeUnusedRevisions(in package: URL, keeping active: UUID) throws {

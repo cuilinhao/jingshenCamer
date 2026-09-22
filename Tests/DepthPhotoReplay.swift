@@ -48,7 +48,7 @@ struct DepthPhotoReplay {
             captureSummary: "offline replay; caller must supply unblurred same-frame RGB and native depth",
             nativePortraitMatte: nativeMatte)
         let processor = DepthPhotoProcessor()
-        let result = try await processor.process(photo)
+        let result = try await processor.process(photo, renderer: .apple)
         let legacy = try await processor.process(photo, renderer: .legacy)
         let folder = URL(fileURLWithPath: args[3], isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)

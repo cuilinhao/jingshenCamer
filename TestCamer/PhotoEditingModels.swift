@@ -23,9 +23,11 @@ struct EditablePhotoDocument: Sendable {
     let initialRecipe: PhotoEditRecipe
     var recipe: PhotoEditRecipe
     var previewData: Data
+    /// 与原图一起首次保存的传感器坐标视差附件，后续编辑不可替换。
+    let depthData: Data?
 
     init(id: UUID = UUID(), createdAt: Date = Date(), updatedAt: Date = Date(), sourceData: Data,
-         initialRecipe: PhotoEditRecipe, recipe: PhotoEditRecipe, previewData: Data) {
+         initialRecipe: PhotoEditRecipe, recipe: PhotoEditRecipe, previewData: Data, depthData: Data? = nil) {
         self.id = id
         self.createdAt = createdAt
         self.updatedAt = updatedAt
@@ -33,6 +35,7 @@ struct EditablePhotoDocument: Sendable {
         self.initialRecipe = initialRecipe
         self.recipe = recipe
         self.previewData = previewData
+        self.depthData = depthData
     }
 }
 
