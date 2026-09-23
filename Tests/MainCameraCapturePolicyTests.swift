@@ -19,10 +19,10 @@ struct MainCameraCapturePolicyTests {
         }
         let lidar = candidate("lidar", .lidar, constituents: [rgb[1]])
         let unlocked = candidate("dual-wide", .dualWide)
-        check(MainCameraCapturePolicy.auxiliaries(for: wide, candidates: [unlocked]).isEmpty,
-              "旧系统不能凭变焦或当前场景选中未可精确锁定的双摄")
-        check(MainCameraCapturePolicy.auxiliaries(for: wide, candidates: [unlocked, lidar]).map(\.id) == ["lidar"],
-              "旧系统可用唯一 RGB 为选定主摄的 LiDAR 配对")
+        check(MainCameraCapturePolicy.auxiliaries(for: wide, candidates: [unlocked]).map(\.id) == ["dual-wide"],
+              "旧系统允许探测双摄深度，运行后再验证并锁定实际主摄")
+        check(MainCameraCapturePolicy.auxiliaries(for: wide, candidates: [unlocked, lidar]).map(\.id) == ["dual-wide", "lidar"],
+              "旧系统按双摄和 LiDAR 顺序探测真实深度能力")
         let ordered = MainCameraCapturePolicy.auxiliaries(for: wide, candidates: [
             lidar, candidate("triple", .triple, locked: true),
             candidate("dual", .dual, locked: true), candidate("dual-wide", .dualWide, locked: true)])
@@ -55,6 +55,14 @@ struct MainCameraCapturePolicyTests {
               switchOverFactors: [.nan]) == nil, "无效视场倍率不得用于硬件配置")
         check(MainCameraCapturePolicy.nativeRawZoom(selectedID: "wide-A", constituentIDs: ["other"],
               switchOverFactors: []) == nil, "视场匹配也必须使用精确 ID")
+        check(MainCameraCapturePolicy.prefersAppleDepth(isFront: true, rearLensKind: nil),
+              "前置优先原生深度和苹果滤镜")
+        check(MainCameraCapturePolicy.prefersAppleDepth(isFront: false, rearLensKind: .wide),
+              "主摄优先原生深度和苹果滤镜")
+        for kind in [CameraLensKind.ultraWide, .telephoto] {
+            check(!MainCameraCapturePolicy.prefersAppleDepth(isFront: false, rearLensKind: kind),
+                  "其他后置镜头继续模型处理")
+        }
         let sources: Set<String> = ["wide", "dual-wide"]
         check(MainCameraCapturePolicy.acceptsMainPhoto(sourceType: "dual-wide", expectedSourceTypes: sources, fusionEnabled: false),
               "虚拟输入的普通照片按 SDK 约定可报告虚拟 sourceDeviceType")
@@ -113,6 +121,14 @@ struct MainCameraCapturePolicyTests {
               "双摄配置事务尚未运行时不要求 activePrimary 已生效")
         check(rejection(dual, configuredID: "dual", kind: .dual, phase: .configuration) == .requestedPrimaryNotLocked,
               "双摄配置阶段必须已成功请求精确锁定")
+        check(rejection(unlocked, configuredID: "dual-wide", kind: .dualWide, phase: .configuration) == nil,
+              "旧系统配置时允许 primary 尚未出现，不因缺少 iOS 27 API 拒绝深度输入")
+        check(rejection(unlocked, configuredID: "dual-wide", kind: .dualWide, primary: exactPrimary,
+                        requestedLocked: true, activeLocked: true) == nil,
+              "旧系统运行后匹配主摄并锁定当前 primary 可交付原生深度")
+        check(rejection(unlocked, configuredID: "dual-wide", kind: .dualWide, primary: otherPrimary,
+                        requestedLocked: true, activeLocked: true) == .activePrimaryMismatch,
+              "旧锁定 API 不能把其他镜头冒充主摄")
         for kind in [MainCameraAuxiliaryKind.dualWide, .dual, .triple] {
             let input = candidate("stereo", kind, locked: true)
             check(rejection(input, configuredID: "stereo", kind: kind, primary: exactPrimary,
@@ -157,10 +173,24 @@ struct MainCameraCapturePolicyTests {
               "重新锁定仍失败后降级，不循环重试")
         check(MainCameraCapturePolicy.captureRecovery(for: .activePrimaryMissing, auxiliaryKind: .dual,
             supportsExactPrimaryLock: false, relockAttempted: false) == .restorePhysicalMain,
-              "无法精确锁定时直接回独立主摄")
+              "旧系统 primary 缺失时不能猜测当前镜头，回独立主摄")
         check(MainCameraCapturePolicy.captureRecovery(for: .inputIDMismatch, auxiliaryKind: .dual,
             supportsExactPrimaryLock: true, relockAttempted: false) == .restorePhysicalMain,
               "结构性输入身份错误不能尝试在错误设备上锁定")
+        for reason in [MainCameraIdentityRejection.requestedPrimaryNotLocked, .activePrimaryNotLocked] {
+            check(MainCameraCapturePolicy.captureRecovery(for: reason, auxiliaryKind: .dualWide,
+                supportsExactPrimaryLock: false, primaryMatchesSelected: true,
+                relockAttempted: false) == .lockCurrentPrimary,
+                  "旧系统当前确为所选主摄时尝试锁定当前 primary")
+            check(MainCameraCapturePolicy.captureRecovery(for: reason, auxiliaryKind: .dualWide,
+                supportsExactPrimaryLock: false, primaryMatchesSelected: false,
+                relockAttempted: false) == .restorePhysicalMain,
+                  "旧系统不能通过锁定错误或未知 primary 猜测主摄")
+            check(MainCameraCapturePolicy.captureRecovery(for: reason, auxiliaryKind: .dualWide,
+                supportsExactPrimaryLock: false, primaryMatchesSelected: true,
+                relockAttempted: true) == .restorePhysicalMain,
+                  "旧系统锁定失败后降级，不循环重试")
+        }
         print("Main camera capture policy: \(checks) checks, \(failures) failures")
         if failures != 0 { exit(1) }
     }

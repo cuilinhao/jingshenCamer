@@ -1,4 +1,4 @@
-// DepthPhotoProcessor.swift — 主摄优先苹果原生景深，其他镜头与失败回退使用计算景深
+// DepthPhotoProcessor.swift — 主摄和前置优先苹果原生景深，失败时按拍摄策略使用模型景深
 // 只处理一次快门的照片，不参与普通取景；可编辑源由独立照片存储管理。
 import Foundation
 import CoreImage
@@ -73,7 +73,7 @@ final class DepthPhotoProcessor: @unchecked Sendable {
                         var appleFallbackReason: String?
                         if prefersApple, renderer == .apple, !primary.outcome.canCompare {
                             appleFallbackReason = primary.outcome.rawValue
-                            primary = try render(photo, renderer: .computational)
+                            primary = try renderComputational(photo, forceEstimation: photo.forceModelOnAppleFailure)
                         } else if prefersApple, renderer != .apple {
                             appleFallbackReason = "native depth unavailable"
                         }
@@ -314,7 +314,7 @@ final class DepthPhotoProcessor: @unchecked Sendable {
 
     /// Native and estimated maps share a renderer and a durable edit format.
     /// No synthetic map is inserted into AVDepthData or labelled metric depth.
-    private func renderComputational(_ photo: CapturedPhoto) throws -> ProcessedPhoto {
+    private func renderComputational(_ photo: CapturedPhoto, forceEstimation: Bool = false) throws -> ProcessedPhoto {
         defer { context.clearCaches() }
         let started = ProcessInfo.processInfo.systemUptime
         guard let source = CGImageSourceCreateWithData(photo.data as CFData, nil),
@@ -340,9 +340,10 @@ final class DepthPhotoProcessor: @unchecked Sendable {
                 let depth: DepthRaster
                 let depthSource: PhotoDepthSource
                 var nativeSelection: (point: NormalizedImagePoint?, isPerson: Bool, source: String)?
-                // A delivered map may contain invalid samples or have the wrong
-                // field of view. Those maps cannot suppress the estimator fallback.
-                let native = photo.nativeDepth.flatMap { snapshot -> DepthRaster? in
+                // Camera Apple failures explicitly request model estimation.
+                // Imports and explicit computational comparisons retain native
+                // reuse, but an invalid map cannot suppress their model fallback.
+                let native = (forceEstimation ? nil : photo.nativeDepth).flatMap { snapshot -> DepthRaster? in
                     let upright = snapshot.raster.oriented(exif: orientation.rawValue)
                     guard abs((CGFloat(upright.width)/CGFloat(upright.height)) /
                               (original.extent.width/original.extent.height) - 1) <= 0.02,

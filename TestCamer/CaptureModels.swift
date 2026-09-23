@@ -32,14 +32,16 @@ struct CapturedPhoto: Sendable {
     let captureSummary: String
     let nativePortraitMatte: NativePortraitMatteSnapshot?
     let captureID: Int64?
-    /// 快门时冻结：后置主摄优先保留原生容器并调用苹果景深；其他镜头用智能景深。
+    /// 快门时冻结：后置主摄与前置优先原生深度及苹果滤镜；其他后置镜头用模型。
     let prefersAppleDepth: Bool
+    /// 相机拍摄的苹果路径失败后重新估计模型深度；相册导入保留既有原生深度回退。
+    let forceModelOnAppleFailure: Bool
 
     init(data: Data, depthRequested: Bool, hasDepthData: Bool,
          nativeDepth: NativeDepthSnapshot?, options: DepthOptions,
          transientDeviceFocus: NormalizedImagePoint?, captureSummary: String,
          nativePortraitMatte: NativePortraitMatteSnapshot? = nil, captureID: Int64? = nil,
-         prefersAppleDepth: Bool = false) {
+         prefersAppleDepth: Bool = false, forceModelOnAppleFailure: Bool = false) {
         self.data = data
         self.depthRequested = depthRequested
         self.hasDepthData = hasDepthData
@@ -50,5 +52,6 @@ struct CapturedPhoto: Sendable {
         self.nativePortraitMatte = nativePortraitMatte
         self.captureID = captureID
         self.prefersAppleDepth = prefersAppleDepth
+        self.forceModelOnAppleFailure = forceModelOnAppleFailure
     }
 }

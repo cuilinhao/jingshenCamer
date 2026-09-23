@@ -1019,17 +1019,19 @@ private extension ViewController {
         depthSwitch.setOn(active, animated: false)
         depthTitleLabel.text = active ? "智能景深" : "普通拍照"
         if let state = cameraState {
-            let isMain = !state.isFront && state.rearLensOptions.first {
+            let rearLensKind = state.rearLensOptions.first {
                 $0.id == state.selectedRearLensID
-            }?.kind == .wide
-            if active && isMain && supported { depthTitleLabel.text = "苹果景深" }
+            }?.kind
+            let prefersAppleDepth = MainCameraCapturePolicy.prefersAppleDepth(
+                isFront: state.isFront, rearLensKind: rearLensKind)
+            if active && prefersAppleDepth && supported { depthTitleLabel.text = "苹果景深" }
             let zoom = String(format: "%.1f×", Double(state.zoomFactor))
                 .replacingOccurrences(of: ".0×", with: "×")
             let fieldOfView = abs(state.zoomFactor - 1) < 0.001 ? "原生视角" : "数码变焦 \(zoom)"
             let lensHint = "\(state.activeLensName) · \(fieldOfView)"
-            let sourceHint = supported
-                ? (isMain ? "主摄成像 · 苹果原生景深优先" : "原生深度 · 智能渲染")
-                : (isMain ? "主摄原生深度不可用 · 本机估计" : "本机估计深度")
+            let sourceHint = prefersAppleDepth
+                ? (supported ? "苹果原生景深优先" : "原生深度不可用 · 本机估计")
+                : "本机估计深度"
             let captureHint = active ? "\(sourceHint) · 拍完可换焦、调虚化" : "景深已关闭"
             depthHintLabel.text = "\(lensHint)\n\(captureHint)"
         } else {

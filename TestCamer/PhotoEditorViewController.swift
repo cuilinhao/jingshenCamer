@@ -259,7 +259,7 @@ final class PhotoEditorViewController: UIViewController {
     }
 
     private func updateRendererLabel() {
-        // 附件决定实际编辑路线；重开照片也沿用同一规则，不能沿用主摄按钮的意图。
+        // 附件决定实际编辑路线；重开照片也沿用同一规则，不能只按拍摄镜头推断。
         if document.depthData != nil {
             rendererLabel.text = document.renderingInfo?.appleFallbackReason != nil
                 ? "智能景深 · 本次苹果景深不可用，已自动回退"

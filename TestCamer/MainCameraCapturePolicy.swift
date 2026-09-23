@@ -25,16 +25,20 @@ enum MainCameraIdentityPhase: Sendable {
 
 enum MainCameraIdentityRejection: String, Sendable {
     case selectedLensNotWide, currentInputNotAuxiliary, inputIDMismatch, inputKindMismatch
-    case inputNotVirtual, selectedPhysicalWideMissing, lidarRGBCountInvalid, exactPrimaryLockUnsupported
+    case inputNotVirtual, selectedPhysicalWideMissing, lidarRGBCountInvalid
     case requestedPrimaryNotLocked, activePrimaryMissing, activePrimaryNotPhysicalRGB
     case activePrimaryMismatch, activePrimaryNotLocked
 }
 
 enum MainCameraCaptureRecovery: Sendable {
-    case useCurrentInput, relockExactPrimary, restorePhysicalMain
+    case useCurrentInput, relockExactPrimary, lockCurrentPrimary, restorePhysicalMain
 }
 
 enum MainCameraCapturePolicy {
+    static func prefersAppleDepth(isFront: Bool, rearLensKind: CameraLensKind?) -> Bool {
+        isFront || rearLensKind == .wide
+    }
+
     static func acceptsMainPhoto(sourceType: String, expectedSourceTypes: Set<String>, fusionEnabled: Bool) -> Bool {
         !fusionEnabled && expectedSourceTypes.contains(sourceType)
     }
@@ -55,7 +59,8 @@ enum MainCameraCapturePolicy {
         if candidate.kind == .lidar {
             return candidate.rgbConstituents.count == 1 ? nil : .lidarRGBCountInvalid
         }
-        return candidate.supportsExactPrimaryLock ? nil : .exactPrimaryLockUnsupported
+        // iOS 26 等旧系统也支持照片深度；是否可锁住所选 RGB 留到运行后核实。
+        return nil
     }
 
     /// 配置与快门共用配对规则；配置事务中不要求尚未运行的 active-primary 状态已生效。
@@ -73,8 +78,10 @@ enum MainCameraCapturePolicy {
             guard let primary, !primary.isVirtual, primary.rgbKind != nil else { return nil }
             return primary.id == selected.id && primary.rgbKind == .wide ? nil : .activePrimaryMismatch
         }
+        if phase == .configuration {
+            return input.supportsExactPrimaryLock && !requestedPrimaryLocked ? .requestedPrimaryNotLocked : nil
+        }
         guard requestedPrimaryLocked else { return .requestedPrimaryNotLocked }
-        if phase == .configuration { return nil }
         guard let primary else { return .activePrimaryMissing }
         guard !primary.isVirtual, primary.rgbKind != nil else { return .activePrimaryNotPhysicalRGB }
         guard primary.id == selected.id, primary.rgbKind == .wide else { return .activePrimaryMismatch }
@@ -83,10 +90,15 @@ enum MainCameraCapturePolicy {
 
     static func captureRecovery(for rejection: MainCameraIdentityRejection?,
                                 auxiliaryKind: MainCameraAuxiliaryKind, supportsExactPrimaryLock: Bool,
+                                primaryMatchesSelected: Bool = false,
                                 relockAttempted: Bool) -> MainCameraCaptureRecovery {
         guard let rejection else { return .useCurrentInput }
-        guard auxiliaryKind != .lidar, supportsExactPrimaryLock, !relockAttempted else {
+        guard auxiliaryKind != .lidar, !relockAttempted else {
             return .restorePhysicalMain
+        }
+        if !supportsExactPrimaryLock {
+            return primaryMatchesSelected && (rejection == .requestedPrimaryNotLocked || rejection == .activePrimaryNotLocked)
+                ? .lockCurrentPrimary : .restorePhysicalMain
         }
         switch rejection {
         case .requestedPrimaryNotLocked, .activePrimaryMissing, .activePrimaryNotPhysicalRGB,
