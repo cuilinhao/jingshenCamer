@@ -59,6 +59,17 @@ final class DepthPhotoProcessor: @unchecked Sendable {
         let prefersApple = requestedRenderer == nil && photo.prefersAppleDepth && photo.options.enabled
         let canTryApple = photo.depthRequested && photo.hasDepthData && photo.nativeDepth != nil
         let renderer = requestedRenderer ?? (prefersApple && canTryApple ? .apple : .computational)
+        // 同次快门记录路由输入，区分未请求、未交付和交付后复制失败。
+        TestLog.shared.record("[DepthTrace] stage=route requested=\(photo.depthRequested) delivered=\(photo.hasDepthData) " +
+            "copied=\(photo.nativeDepth != nil) matte=\(photo.nativePortraitMatte != nil) enabled=\(photo.options.enabled) " +
+            "prefersApple=\(photo.prefersAppleDepth) canTryApple=\(canTryApple) forceModel=\(photo.forceModelOnAppleFailure) " +
+            "explicit=\(requestedRenderer?.rawValue ?? "none") chosen=\(renderer.rawValue)", category: "processor", captureID: photo.captureID)
+        if renderer != .apple {
+            let reason = requestedRenderer != nil ? "explicit_renderer" : !photo.options.enabled ? "disabled"
+                : !photo.prefersAppleDepth ? "lens_policy" : !photo.depthRequested ? "not_requested"
+                : !photo.hasDepthData ? "not_delivered" : "copy_missing"
+            TestLog.shared.record("[DepthTrace] stage=apple_skip reason=\(reason)", category: "processor", captureID: photo.captureID)
+        }
         TestLog.shared.record("process queued bytes=\(photo.data.count) enabled=\(photo.options.enabled) " +
             "depthRequested=\(photo.depthRequested) hasDepth=\(photo.hasDepthData) " +
             "nativeDepth=\(photo.nativeDepth != nil) nativeMatte=\(photo.nativePortraitMatte != nil) " +
@@ -73,6 +84,8 @@ final class DepthPhotoProcessor: @unchecked Sendable {
                         var appleFallbackReason: String?
                         if prefersApple, renderer == .apple, !primary.outcome.canCompare {
                             appleFallbackReason = primary.outcome.rawValue
+                            TestLog.shared.record("[DepthTrace] stage=apple_fallback reason=\(primary.outcome.rawValue) forceModel=\(photo.forceModelOnAppleFailure)",
+                                category: "processor", captureID: photo.captureID)
                             primary = try renderComputational(photo, forceEstimation: photo.forceModelOnAppleFailure)
                         } else if prefersApple, renderer != .apple {
                             appleFallbackReason = "native depth unavailable"
@@ -95,10 +108,14 @@ final class DepthPhotoProcessor: @unchecked Sendable {
                                                       category: "processor", captureID: photo.captureID)
                             }
                         }
+                        TestLog.shared.record("[DepthTrace] stage=processed renderer=\(primary.renderer.rawValue) outcome=\(primary.outcome.rawValue)",
+                            category: "processor", captureID: photo.captureID)
                         return primary
                     }
                 }
                 if case .failure(let error) = result {
+                    TestLog.shared.record("[DepthTrace] stage=process_failed error=\(TestLog.errorDescription(error))",
+                        category: "processor", captureID: photo.captureID)
                     TestLog.shared.record("process failed \(TestLog.errorDescription(error))",
                                           category: "processor", captureID: photo.captureID)
                 }
@@ -163,12 +180,15 @@ final class DepthPhotoProcessor: @unchecked Sendable {
         if !photo.options.enabled {
             outcome = .disabled
             log("depth bypass reason=option_disabled")
+            log("[DepthTrace] stage=apple_skip reason=disabled")
         } else if !photo.depthRequested {
             outcome = .unsupported
             log("depth bypass reason=not_requested_or_unsupported")
+            log("[DepthTrace] stage=apple_skip reason=not_requested")
         } else if !photo.hasDepthData {
             outcome = .missingDepth
             log("depth bypass reason=camera_did_not_deliver_depth")
+            log("[DepthTrace] stage=apple_skip reason=not_delivered")
         } else if let nativeDepth = photo.nativeDepth {
             do {
                 begin("depth_orientation_and_statistics")
@@ -199,7 +219,7 @@ final class DepthPhotoProcessor: @unchecked Sendable {
                     let sensorFocus = focus.oriented(exif: inverseEXIF)
                     selectedEditRecipe = PhotoEditRecipe(aperture: photo.options.aperture, sensorFocus: sensorFocus)
                     let apple = try AppleDepthRenderer(context: context).render(photoData: photo.data,
-                        aperture: photo.options.aperture, sensorFocus: sensorFocus)
+                        aperture: photo.options.aperture, sensorFocus: sensorFocus, trace: log)
                     usedAppleMetadataCompatibility = apple.usedMetadataCompatibility
                     guard apple.image.extent == original.extent else { throw DepthAnalysisError.alignmentMismatch }
                     // 官方滤镜没有公开其内部虚化量图。全图仅用于输出变化统计，
@@ -257,6 +277,9 @@ final class DepthPhotoProcessor: @unchecked Sendable {
                 }
                 finish("available=\(diagnosticMaskData != nil) bytes=\(diagnosticMaskData?.count ?? 0)")
             } catch let error as DepthAnalysisError {
+                if renderer == .apple {
+                    log("[DepthTrace] stage=apple_failed renderer=\(renderer.rawValue) at=\(stage) error=\(TestLog.errorDescription(error))")
+                }
                 log("stage failed=\(stage) \(TestLog.errorDescription(error))")
                 notes.append("analysisIssue=\(error.localizedDescription)")
                 switch error {
@@ -267,6 +290,9 @@ final class DepthPhotoProcessor: @unchecked Sendable {
                 }
                 outputCG = nil
             } catch {
+                if renderer == .apple {
+                    log("[DepthTrace] stage=apple_failed renderer=\(renderer.rawValue) at=\(stage) error=\(TestLog.errorDescription(error))")
+                }
                 log("stage failed=\(stage) \(TestLog.errorDescription(error))")
                 notes.append("renderIssue=\(error.localizedDescription)")
                 outcome = .renderFailed
@@ -276,6 +302,7 @@ final class DepthPhotoProcessor: @unchecked Sendable {
             // 已交付深度但无法复制时应报无效深度，而不是误称设备不支持。
             outcome = .invalidDepth
             log("depth bypass reason=delivered_depth_snapshot_missing")
+            log("[DepthTrace] stage=apple_skip reason=copy_missing")
         }
 
         if outputCG == nil {

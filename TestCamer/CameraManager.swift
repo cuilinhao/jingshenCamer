@@ -329,7 +329,18 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
                                                 logicalRearLensID: position == .back ? selectedRearDeviceID : nil,
                                                 continuation: continuation)
                 TestLog.shared.record("begin enabled=\(options.enabled), depthRequested=\(useDepth), nativeMatteRequested=\(settings.isPortraitEffectsMatteDeliveryEnabled), aperture=\(options.aperture), angle=\(rotationAngle), mirrored=\(mirrored), codec=\(codec.rawValue), flash=\(settings.flashMode.rawValue), tapFocus=\(transientFocus != nil)", category: "capture", captureID: id)
-                TestLog.shared.record("semanticMattesRequested=\(settings.enabledSemanticSegmentationMatteTypes.map(\.rawValue).joined(separator: ","))", category: "capture", captureID: id)
+                TestLog.shared.record("[DepthTrace] stage=submit app=TestCamer trace=20260923-2 bundle=\(Bundle.main.bundleIdentifier ?? "unknown") " +
+                    "version=\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown") " +
+                    "build=\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown") " +
+                    "os=\(ProcessInfo.processInfo.operatingSystemVersionString) " +
+                    "\(DepthTrace.device(deviceInput?.device, output: photoOutput, preset: session.sessionPreset)) " +
+                    "requestMax=\(settings.maxPhotoDimensions.width)x\(settings.maxPhotoDimensions.height) " +
+                    "quality=\(settings.photoQualityPrioritization.rawValue) depth=\(settings.isDepthDataDeliveryEnabled) " +
+                    "filtered=\(settings.isDepthDataFiltered) embeds=\(settings.embedsDepthDataInPhoto) " +
+                    "matte=\(settings.isPortraitEffectsMatteDeliveryEnabled) matteEmbeds=\(settings.embedsPortraitEffectsMatteInPhoto) " +
+                    "semantic=\(settings.enabledSemanticSegmentationMatteTypes.map(\.rawValue).joined(separator: ",")) " +
+                    "semanticEmbeds=\(settings.embedsSemanticSegmentationMattesInPhoto) format=\(String(describing: settings.format))",
+                    category: "capture", captureID: id)
                 if let device = deviceInput?.device {
                     TestLog.shared.record("deviceType=\(device.deviceType.rawValue), position=\(device.position.rawValue), zoom=\(device.videoZoomFactor), focusMode=\(device.focusMode.rawValue), adjustingFocus=\(device.isAdjustingFocus), adjustingExposure=\(device.isAdjustingExposure), ISO=\(device.iso), exposureSeconds=\(device.exposureDuration.seconds)", category: "capture", captureID: id)
                 }
@@ -357,9 +368,12 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto,
                      error: Error?) {
         let id = photo.resolvedSettings.uniqueID
-        TestLog.shared.record("processing callback error=\(error.map(TestLog.errorDescription) ?? "none")", category: "capture", captureID: id)
+        TestLog.shared.record("[DepthTrace] stage=callback error=\(error.map(TestLog.errorDescription) ?? "none") " +
+            "\(DepthTrace.photo(photo)) \(DepthTrace.depth(photo.depthData))", category: "capture", captureID: id)
         let hasDepth = photo.depthData != nil
         let data = error == nil ? photo.fileDataRepresentation() : nil
+        TestLog.shared.record("[DepthTrace] stage=export \(DepthTrace.data(data)) \(DepthTrace.depth(photo.depthData))",
+            category: "capture", captureID: id)
         // 关键修订：把“本张照片的深度值”交给渲染器，而不是只交一个 hasDepth 布尔值。
         var snapshot: NativeDepthSnapshot?
         var depthIssue: String?
@@ -377,7 +391,10 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
                 return nil
             }
         } : nil
-        TestLog.shared.record("delivered bytes=\(data?.count ?? 0), depth=\(hasDepth), copiedDepth=\(frozenSnapshot != nil), depthCopyError=\(frozenIssue ?? "none"), matteDelivered=\(photo.portraitEffectsMatte != nil), matteCopied=\(frozenMatte != nil)", category: "capture", captureID: id)
+        TestLog.shared.record("[DepthTrace] stage=copy bytes=\(data?.count ?? 0) depth=\(hasDepth) " +
+            "snapshot=\(frozenSnapshot.map { "\($0.raster.width)x\($0.raster.height)" } ?? "nil") error=\(frozenIssue ?? "none") " +
+            "matteDelivered=\(photo.portraitEffectsMatte != nil) matte=\(frozenMatte.map { "\($0.width)x\($0.height)" } ?? "nil")",
+            category: "capture", captureID: id)
         let sourceType = photo.sourceDeviceType?.rawValue ?? "unknown"
         let fusionEnabled = photo.resolvedSettings.isVirtualDeviceFusionEnabled
         TestLog.shared.record("photo sourceDeviceType=\(sourceType), virtualDeviceFusionEnabled=\(fusionEnabled), deliveredDepth=\(hasDepth)", category: "capture", captureID: id)
@@ -414,7 +431,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, @unchecked S
                      error: Error?) {
         sessionQueue.async { [self] in
             let id = resolvedSettings.uniqueID
-            TestLog.shared.record("terminal callback error=\(error.map(TestLog.errorDescription) ?? "none")", category: "capture", captureID: id)
+            TestLog.shared.record("[DepthTrace] stage=terminal error=\(error.map(TestLog.errorDescription) ?? "none")", category: "capture", captureID: id)
             guard let pending = pendingCapture, pending.id == id else { return }
             if let error {
                 finishCapture(id: id, result: .failure(error))

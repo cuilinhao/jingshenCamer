@@ -35,11 +35,15 @@ final class AppleDepthRenderer {
     init(context: CIContext) { self.context = context }
 
     func render(photoData: Data, aperture: Float,
-                sensorFocus: NormalizedImagePoint?) throws -> AppleDepthOutput {
+                sensorFocus: NormalizedImagePoint?, trace: ((String) -> Void)? = nil) throws -> AppleDepthOutput {
+        var stage = "apple_args"
+        var done = false
+        defer { if !done { trace?("[DepthTrace] stage=apple_failed at=\(stage)") } }
         guard aperture.isFinite, aperture >= 1, aperture <= 22 else {
             throw AppleDepthRenderingError.invalidAperture
         }
         guard sensorFocus?.isValid != false else { throw AppleDepthRenderingError.invalidFocus }
+        stage = "apple_container"
         guard let source = CGImageSourceCreateWithData(photoData as CFData, nil),
               CGImageSourceGetCount(source) > 0,
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any],
@@ -48,22 +52,41 @@ final class AppleDepthRenderer {
               width.intValue > 0, height.intValue > 0 else {
             throw AppleDepthRenderingError.invalidPhoto
         }
-        let auxiliary = CGImageSourceCopyAuxiliaryDataInfoAtIndex(source, 0, kCGImageAuxiliaryDataTypeDisparity)
+        trace?("[DepthTrace] stage=apple_container size=\(width)x\(height) type=\(CGImageSourceGetType(source) as String? ?? "unknown")")
+        stage = "apple_aux"
+        let disparity = CGImageSourceCopyAuxiliaryDataInfoAtIndex(source, 0, kCGImageAuxiliaryDataTypeDisparity)
+        let auxiliary = disparity
             ?? CGImageSourceCopyAuxiliaryDataInfoAtIndex(source, 0, kCGImageAuxiliaryDataTypeDepth)
+        trace?("[DepthTrace] stage=apple_aux present=\(auxiliary != nil) type=\(disparity != nil ? "disparity" : (auxiliary != nil ? "depth" : "none"))")
         guard let dictionary = auxiliary as? [AnyHashable: Any] else {
             throw AppleDepthRenderingError.missingDepth
         }
         do {
             let depth = try AVDepthData(fromDictionaryRepresentation: dictionary)
+            stage = "apple_validate"
+            trace?("[DepthTrace] stage=apple_validate size=\(CVPixelBufferGetWidth(depth.depthDataMap))x\(CVPixelBufferGetHeight(depth.depthDataMap)) format=\(depth.depthDataType)")
             try validateDepthCoverage(depth)
         }
         catch { throw AppleDepthRenderingError.invalidDepth }
-        guard let filter = context.depthBlurEffectFilter(forImageData: photoData, options: nil),
-              filter.inputKeys.contains("inputAperture"), filter.inputKeys.contains("inputFocusRect"),
-              let input = filter.value(forKey: kCIInputImageKey) as? CIImage,
-              filter.value(forKey: kCIInputDisparityImageKey) is CIImage else {
+        // 日志贴着真正的系统调用；工厂和每次 outputImage 均仍只求值一次。
+        stage = "apple_api_call"
+        trace?("[DepthTrace] stage=apple_api_call")
+        let built = context.depthBlurEffectFilter(forImageData: photoData, options: nil)
+        stage = "apple_api_return"
+        trace?("[DepthTrace] stage=apple_api_return filter=\(built != nil)")
+        guard let filter = built else { throw AppleDepthRenderingError.unavailable }
+        stage = "apple_inputs"
+        trace?("[DepthTrace] stage=apple_inputs keys=\(filter.inputKeys.sorted().joined(separator: ","))")
+        guard filter.inputKeys.contains("inputAperture"), filter.inputKeys.contains("inputFocusRect") else {
             throw AppleDepthRenderingError.unavailable
         }
+        let base = filter.value(forKey: kCIInputImageKey) as? CIImage
+        let map = base == nil ? nil : filter.value(forKey: kCIInputDisparityImageKey) as? CIImage
+        trace?("[DepthTrace] stage=apple_inputs inputImage=\(base != nil) inputDisparity=\(map != nil) disparityChecked=\(base != nil)")
+        guard let input = base, map != nil else {
+            throw AppleDepthRenderingError.unavailable
+        }
+        stage = "apple_parameters"
         filter.setValue(aperture, forKey: "inputAperture")
         if let point = sensorFocus {
             // The container factory retains sensor orientation. Focus rectangles
@@ -75,7 +98,11 @@ final class AppleDepthRenderer {
             filter.setValue(CIVector(cgRect: CGRect(x: x, y: y, width: size, height: size)),
                             forKey: "inputFocusRect")
         }
-        guard var output = filter.outputImage else { throw AppleDepthRenderingError.invalidOutput }
+        stage = "apple_output"
+        trace?("[DepthTrace] stage=apple_output phase=begin retry=false")
+        let rendered = filter.outputImage
+        trace?("[DepthTrace] stage=apple_output phase=end retry=false present=\(rendered != nil) identity=\(rendered === input)")
+        guard var output = rendered else { throw AppleDepthRenderingError.invalidOutput }
         var usedMetadataCompatibility = false
         // Some macOS runtimes return the exact input object when the native
         // auxiliary metadata path is unsupported. Identity proves a no-op; do
@@ -87,13 +114,19 @@ final class AppleDepthRenderer {
             var disparityProperties = disparity.properties
             let inheritedMetadata = disparityProperties.removeValue(forKey: kCGImageAuxiliaryDataInfoMetadata as String)
             if filter.value(forKey: "inputAuxDataMetadata") != nil || inheritedMetadata != nil {
+                stage = "apple_compat"
+                trace?("[DepthTrace] stage=apple_compat identity=true retry=true")
                 filter.setValue(nil, forKey: "inputAuxDataMetadata")
                 filter.setValue(disparity.settingProperties(disparityProperties), forKey: kCIInputDisparityImageKey)
-                guard let retried = filter.outputImage else { throw AppleDepthRenderingError.invalidOutput }
+                trace?("[DepthTrace] stage=apple_output phase=begin retry=true")
+                let result = filter.outputImage
+                trace?("[DepthTrace] stage=apple_output phase=end retry=true present=\(result != nil) identity=\(result === input)")
+                guard let retried = result else { throw AppleDepthRenderingError.invalidOutput }
                 output = retried
                 usedMetadataCompatibility = true
             }
         }
+        stage = "apple_extent"
         guard output.extent == input.extent,
               output.extent.width.isFinite, output.extent.height.isFinite,
               output.extent.width > 0, output.extent.height > 0 else {
@@ -105,6 +138,8 @@ final class AppleDepthRenderer {
         let notes = usedMetadataCompatibility
             ? "苹果景深（兼容）：系统原生元数据路径直接返回原图；已使用同一苹果滤镜的兼容路径，保留真实深度、校准及可用辅助遮罩。兼容路径未使用辅助深度元数据，效果仍需像素检测。"
             : "苹果公开景深渲染，使用照片中的原生深度、元数据与可用辅助附件"
+        done = true
+        trace?("[DepthTrace] stage=apple_done size=\(upright.extent.width)x\(upright.extent.height) compatibility=\(usedMetadataCompatibility)")
         return AppleDepthOutput(image: upright, notes: notes, usedMetadataCompatibility: usedMetadataCompatibility)
     }
 
